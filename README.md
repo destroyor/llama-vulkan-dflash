@@ -1,10 +1,10 @@
-# buun-llama-cpp
+# llama-vulkan-dflash
 
 ![buunslamma](buunslamma.png)
 
-> **This is a highly experimental fork of llama.cpp. Use at your own discretion.**
+> **This is a fork of [bunn-llama-cpp](https://github.com/spiritbuun/bunn-llama-cpp) with Vulkan and DFlash support. A highly experimental fork of llama.cpp with Trellis-Coded Quantization (TCQ) for KV cache compression.**
 
-A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) with **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats FP16.
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) and [bunn-llama-cpp](https://github.com/spiritbuun/bunn-llama-cpp) with **Vulkan backend** and **DFlash speculative decoding** support, plus **Trellis-Coded Quantization (TCQ)** for KV cache compression. 2-3x more context in the same VRAM, with quality that matches or beats FP16.
 
 **Paper**: [Closing the Gap: Trellis-Coded Quantization for KV Cache at 2-3 Bits](https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache)
 
