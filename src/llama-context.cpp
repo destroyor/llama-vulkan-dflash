@@ -1919,6 +1919,41 @@ void llama_context::set_cross_data_gpu(
     }
 }
 
+void llama_context::set_cross_data_gpu_d2d(
+        llama_seq_id seq_id, void * cross_ring_handle, int cross_len,
+        int n_layers, int n_embd_layer, set_tensor_d2d_vk_fn_t fn_d2d_vk) {
+    int64_t n_target_features = (int64_t)n_layers * n_embd_layer;
+
+    const int64_t max_ctx = dflash_max_cross_ctx();
+    const int64_t capped = (max_ctx > 0 && cross_len > max_ctx) ? max_ctx : cross_len;
+    const int64_t bucket = cross_bucket(capped);
+
+    if (cross.n_enc != bucket) {
+        sched_need_reserve = true;
+    }
+    cross.n_embd     = n_target_features;
+    cross.n_enc      = bucket;
+    cross.n_enc_real = cross_len;
+    cross.v_embd_gpu_vk = cross_ring_handle;
+    cross.v_embd_gpu_n_enc_real = cross_len;
+    cross.fn_set_tensor_d2d_vk = fn_d2d_vk;
+
+    if (cross.v_embd.size() != (size_t)(n_target_features * cross_len)) {
+        cross.v_embd.resize(n_target_features * cross_len);
+    }
+
+    if (seq_id >= 0) {
+        auto & entry = cross.v_embd_per_seq[seq_id];
+        entry.n_enc      = bucket;
+        entry.n_enc_real = cross_len;
+        entry.v_embd_gpu_vk = cross_ring_handle;
+        entry.v_embd_gpu_n_enc_real = cross_len;
+        if (entry.v_embd.size() != (size_t)(n_target_features * cross_len)) {
+            entry.v_embd.resize(n_target_features * cross_len);
+        }
+    }
+}
+
 void llama_context::set_tree_mask(const uint8_t * visibility, int n_tree_tokens) {
     tree_mask.active = true;
     tree_mask.n_tree_tokens = n_tree_tokens;
@@ -4673,6 +4708,7 @@ struct dflash_cross_ring_handle {
     void   (*fn_write)(void *, int, int, const float *, int, int);
     const float * (*fn_interleave)(void *, int, int, int);
     void   (*fn_set_tensor)(void *, const void *, size_t, size_t);
+    void   (*fn_set_tensor_d2d)(struct ggml_tensor *, void *, size_t, size_t);
 };
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
@@ -4691,12 +4727,14 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using write_fn_t      = void   (*)(void *, int, int, const float *, int, int);
     using interleave_fn_t = const float * (*)(void *, int, int, int);
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
+    using set_tensor_d2d_fn_t = void (*)(struct ggml_tensor *, void *, size_t, size_t);
 
-    auto fn_alloc      = (alloc_fn_t)      ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_alloc");
-    auto fn_free       = (free_fn_t)       ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_free");
-    auto fn_write      = (write_fn_t)      ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_write");
-    auto fn_interleave = (interleave_fn_t) ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_interleave");
-    auto fn_set_tensor = (set_tensor_fn_t) ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor");
+    auto fn_alloc          = (alloc_fn_t)          ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_alloc");
+    auto fn_free           = (free_fn_t)           ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_free");
+    auto fn_write          = (write_fn_t)          ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_write");
+    auto fn_interleave     = (interleave_fn_t)     ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_interleave");
+    auto fn_set_tensor     = (set_tensor_fn_t)     ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor");
+    auto fn_set_tensor_d2d = (set_tensor_d2d_fn_t) ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor_d2d");
 
     if (!fn_alloc || !fn_free || !fn_write || !fn_interleave || !fn_set_tensor) {
         return nullptr;
@@ -4706,11 +4744,12 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     if (!gpu_ring) return nullptr;
 
     auto * handle = new dflash_cross_ring_handle();
-    handle->gpu_ring      = gpu_ring;
-    handle->fn_free       = fn_free;
-    handle->fn_write      = fn_write;
-    handle->fn_interleave = fn_interleave;
-    handle->fn_set_tensor = fn_set_tensor;
+    handle->gpu_ring          = gpu_ring;
+    handle->fn_free           = fn_free;
+    handle->fn_write          = fn_write;
+    handle->fn_interleave     = fn_interleave;
+    handle->fn_set_tensor     = fn_set_tensor;
+    handle->fn_set_tensor_d2d = fn_set_tensor_d2d;
     return handle;
 }
 
@@ -4738,11 +4777,23 @@ void llama_dflash_cross_ring_gpu_set_cross(
     if (!handle || !ctx) return;
     auto * h = (dflash_cross_ring_handle *)handle;
 
-    const float * d_staging = h->fn_interleave(h->gpu_ring, ring_write_pos, ring_filled, ctx_window);
-    if (!d_staging) return;
-
     int cross_len = ring_filled < ctx_window ? ring_filled : ctx_window;
-    ctx->set_cross_data_gpu(seq_id, d_staging, cross_len, n_layers, n_embd, h->fn_set_tensor);
+    int64_t n_target_features = (int64_t)n_layers * n_embd;
+
+    if (h->fn_set_tensor_d2d) {
+        const float * d_staging = h->fn_interleave(h->gpu_ring, ring_write_pos, ring_filled, ctx_window);
+        if (!d_staging) return;
+
+        using set_tensor_d2d_vk_fn_t = void (*)(struct ggml_tensor *, void *, size_t, size_t);
+        ctx->set_cross_data_gpu_d2d(seq_id, h->gpu_ring, cross_len,
+                                    n_layers, n_embd,
+                                    (set_tensor_d2d_vk_fn_t)h->fn_set_tensor_d2d);
+    } else {
+        const float * d_staging = h->fn_interleave(h->gpu_ring, ring_write_pos, ring_filled, ctx_window);
+        if (!d_staging) return;
+
+        llama_set_cross_data_seq(ctx, seq_id, d_staging, n_target_features, cross_len);
+    }
 }
 
 void llama_set_tree_mask(llama_context * ctx, const uint8_t * visibility, int n_tree_tokens) {

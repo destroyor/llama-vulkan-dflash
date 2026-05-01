@@ -146,3 +146,5 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+# Added by code-review-graph
+.code-review-graph/

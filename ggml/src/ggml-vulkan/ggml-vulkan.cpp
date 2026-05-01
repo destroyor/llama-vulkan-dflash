@@ -16283,6 +16283,7 @@ extern "C" {
     void dflash_cross_ring_vk_write(void * handle, int layer, int ring_pos, const float * host_data, int n_tokens, int n_embd);
     const float * dflash_cross_ring_vk_interleave(void * handle, int write_pos, int filled, int ctx_window);
     void dflash_cross_ring_vk_set_tensor(void * d_dst, const void * d_src, size_t offset, size_t size);
+    void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cross_ring_handle, size_t src_offset, size_t size);
 }
 
 struct dflash_cross_ring_vk {
@@ -16552,6 +16553,38 @@ extern "C" void dflash_cross_ring_vk_set_tensor(void * d_dst, const void * d_src
     dev->device.destroyFence(fence);
 }
 
+extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cross_ring_handle, size_t src_offset, size_t size) {
+    if (!dst || !cross_ring_handle || size == 0) return;
+
+    auto * ring = (dflash_cross_ring_vk *)cross_ring_handle;
+
+    if (dst->buffer && ggml_backend_buffer_is_vk(dst->buffer)) {
+        auto * buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+        vk_buffer dst_vkbuf = buf_ctx->dev_buffer;
+        size_t dst_offset = vk_tensor_offset(dst) + dst->view_offs;
+
+        vk::CommandBufferAllocateInfo cmd_buf_info(ring->command_pool, vk::CommandBufferLevel::ePrimary, 1);
+        vk::CommandBuffer cmd = ring->vkdev.allocateCommandBuffers(cmd_buf_info)[0];
+
+        vk::CommandBufferBeginInfo begin_info(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+        cmd.begin(begin_info);
+
+        vk::BufferCopy copy_region(src_offset, dst_offset, size);
+        cmd.copyBuffer(ring->staging_buffer, dst_vkbuf->buffer, copy_region);
+
+        cmd.end();
+
+        vk::SubmitInfo submit_info({}, {}, cmd);
+        ring->queue.submit(submit_info, ring->fence);
+        VK_CHECK(ring->vkdev.waitForFences(ring->fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor_d2d waitForFences");
+        ring->vkdev.resetFences(ring->fence);
+        ring->vkdev.freeCommandBuffers(ring->command_pool, cmd);
+    } else if (dst->buffer && ggml_backend_buffer_is_host(dst->buffer)) {
+        const uint8_t * src_ptr = (const uint8_t *)ring->host_staging_ptr + src_offset;
+        ggml_backend_tensor_set(dst, src_ptr, 0, size);
+    }
+}
+
 static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     UNUSED(reg);
     if (strcmp(name, "dflash_cross_ring_gpu_alloc") == 0) {
@@ -16568,6 +16601,9 @@ static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const cha
     }
     if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
         return (void *)dflash_cross_ring_vk_set_tensor;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_set_tensor_d2d") == 0) {
+        return (void *)dflash_cross_ring_vk_set_tensor_d2d;
     }
     return nullptr;
 }

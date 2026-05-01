@@ -436,6 +436,11 @@ public:
     void set_cross_data_gpu(llama_seq_id seq_id, const void * d_staging, int cross_len,
                             int n_layers, int n_embd, set_tensor_d2d_fn_t fn_d2d);
 
+    // DFlash GPU ring: Vulkan D2D path (accepts ggml_tensor* + cross ring handle)
+    using set_tensor_d2d_vk_fn_t = void (*)(struct ggml_tensor *, void *, size_t, size_t);
+    void set_cross_data_gpu_d2d(llama_seq_id seq_id, void * cross_ring_handle, int cross_len,
+                                int n_layers, int n_embd, set_tensor_d2d_vk_fn_t fn_d2d_vk);
+
     // DDTree: set/clear tree attention mask for verification
     void set_tree_mask(const uint8_t * visibility, int n_tree_tokens);
     void clear_tree_mask();
