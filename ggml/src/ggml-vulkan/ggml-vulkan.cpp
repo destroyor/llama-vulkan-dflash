@@ -863,6 +863,7 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    ggml_backend_buffer_type host_buffer_type;
 
     bool disable_fusion;
     bool disable_host_visible_vidmem;
@@ -13905,16 +13906,19 @@ static const char * ggml_backend_vk_host_buffer_name(ggml_backend_buffer_t buffe
 
 static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_free_buffer()");
-    ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buffer->buft->context;
+    ggml_vk_host_free(buft_ctx->device, buffer->context);
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
 
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
     try {
-        ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+        ptr = ggml_vk_host_malloc(buft_ctx->device, size);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
         // fallback to cpu buffer
@@ -13926,26 +13930,22 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
 
     return buffer;
-
-    UNUSED(buft);
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
-
-    UNUSED(buft);
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+    return buft_ctx->device->properties.limits.minMemoryMapAlignment;
 }
 
 static size_t ggml_backend_vk_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
-    return vk_instance.devices[0]->suballocation_block_size;
-
-    UNUSED(buft);
+    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
+    return buft_ctx->device->suballocation_block_size;
 }
 
-// Should be changed to return device-specific host buffer type
-// but that probably requires changes in llama.cpp
-ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_vk_buffer_type_host = {
+static void ggml_backend_vk_init_host_buffer_type(vk_device device, size_t idx) {
+    if (device->host_buffer_type.iface.get_name != nullptr) return;
+
+    device->host_buffer_type = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_vk_host_buffer_type_name,
             /* .alloc_buffer     = */ ggml_backend_vk_host_buffer_type_alloc_buffer,
@@ -13954,15 +13954,16 @@ ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
             /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), 0),
-        /* .context  = */ nullptr,
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
+        /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
     };
+}
 
-    // Make sure device 0 is initialized
+ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type() {
     ggml_vk_instance_init();
-    ggml_vk_get_device(0);
-
-    return &ggml_backend_vk_buffer_type_host;
+    vk_device dev = ggml_vk_get_device(0);
+    ggml_backend_vk_init_host_buffer_type(dev, 0);
+    return &dev->host_buffer_type;
 }
 
 
@@ -13993,7 +13994,7 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
 static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_async(" << size << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == &ctx->device->host_buffer_type) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -14040,7 +14041,7 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
 static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_async(" << size << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
-    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == ggml_backend_vk_host_buffer_type()) && "unsupported buffer type");
+    GGML_ASSERT((tensor->buffer->buft == ggml_backend_vk_get_default_buffer_type(backend) || tensor->buffer->buft == &ctx->device->host_buffer_type) && "unsupported buffer type");
 
     if (size == 0) {
         return;
@@ -15369,7 +15370,8 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
             *total += heap.size;
 
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+                *free += (budgetprops.heapBudget[i] > budgetprops.heapUsage[i])
+                    ? (budgetprops.heapBudget[i] - budgetprops.heapUsage[i]) : 0;
             } else {
                 *free += heap.size;
             }
@@ -15458,8 +15460,10 @@ static ggml_backend_buffer_type_t ggml_backend_vk_device_get_buffer_type(ggml_ba
 }
 
 static ggml_backend_buffer_type_t ggml_backend_vk_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    UNUSED(dev);
-    return ggml_backend_vk_host_buffer_type();
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    vk_device vkdev = ggml_vk_get_device(ctx->device);
+    ggml_backend_vk_init_host_buffer_type(vkdev, ctx->device);
+    return &vkdev->host_buffer_type;
 }
 
 static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_dev_t dev) {
@@ -16278,11 +16282,12 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
 }
 
 extern "C" {
-    void * dflash_cross_ring_vk_alloc(int n_layers, int n_embd, int ring_size);
+    int dflash_cross_ring_vk_find_device_idx(const char * dev_name);
+    void * dflash_cross_ring_vk_alloc(int n_layers, int n_embd, int ring_size, int device_idx);
     void dflash_cross_ring_vk_free(void * handle);
     void dflash_cross_ring_vk_write(void * handle, int layer, int ring_pos, const float * host_data, int n_tokens, int n_embd);
     const float * dflash_cross_ring_vk_interleave(void * handle, int write_pos, int filled, int ctx_window);
-    void dflash_cross_ring_vk_set_tensor(void * d_dst, const void * d_src, size_t offset, size_t size);
+    void dflash_cross_ring_vk_set_tensor(void * cross_ring_handle, const void * d_src, size_t offset, size_t size);
     void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cross_ring_handle, size_t src_offset, size_t size);
 }
 
@@ -16297,6 +16302,7 @@ struct dflash_cross_ring_vk {
     vk::Buffer host_staging_buffer;
     vk::DeviceMemory host_staging_memory;
     void * host_staging_ptr;
+    vk_device device;
     vk::Device vkdev;
     vk::CommandPool command_pool;
     vk::Queue queue;
@@ -16325,19 +16331,46 @@ static uint32_t vk_find_memory_type(vk_device dev, uint32_t type_filter, vk::Mem
     return UINT32_MAX;
 }
 
-extern "C" void * dflash_cross_ring_vk_alloc(int n_layers, int n_embd, int ring_size) {
+extern "C" int dflash_cross_ring_vk_find_device_idx(const char * dev_name) {
+    if (!dev_name) return -1;
+    std::string target(dev_name);
+    for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
+        if (vk_instance.devices[i] != nullptr) {
+            if (vk_instance.devices[i]->properties.deviceName == target) {
+                return (int)i;
+            }
+        }
+    }
+    for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
+        if (vk_instance.devices[i] != nullptr) {
+            if (strstr(vk_instance.devices[i]->properties.deviceName.data(), dev_name) != nullptr) {
+                return (int)i;
+            }
+        }
+    }
+    return -1;
+}
+
+extern "C" void * dflash_cross_ring_vk_alloc(int n_layers, int n_embd, int ring_size, int device_idx) {
     const char * env = getenv("GGML_DFLASH_GPU_RING");
     if (env && atoi(env) == 0) {
         return nullptr;
     }
 
-    vk_device dev = vk_get_first_device();
+    vk_device dev = nullptr;
+    if (device_idx >= 0 && device_idx < GGML_VK_MAX_DEVICES) {
+        dev = vk_instance.devices[device_idx];
+    }
+    if (!dev) {
+        dev = vk_get_first_device();
+    }
     if (!dev) return nullptr;
 
     auto * ring = new dflash_cross_ring_vk();
     ring->n_layers = n_layers;
     ring->n_embd = n_embd;
     ring->ring_size = ring_size;
+    ring->device = dev;
     ring->vkdev = dev->device;
     ring->queue = dev->transfer_queue.queue;
     ring->queue_family_index = dev->transfer_queue.queue_family_index;
@@ -16523,34 +16556,34 @@ extern "C" const float * dflash_cross_ring_vk_interleave(void * handle, int writ
     return (const float *)ring->host_staging_ptr;
 }
 
-extern "C" void dflash_cross_ring_vk_set_tensor(void * d_dst, const void * d_src, size_t offset, size_t size) {
-    if (!d_dst || !d_src || size == 0) return;
+extern "C" void dflash_cross_ring_vk_set_tensor(void * cross_ring_handle, const void * d_src, size_t offset, size_t size) {
+    if (!cross_ring_handle || !d_src || size == 0) return;
 
-    vk_device dev = vk_get_first_device();
+    auto * ring = (dflash_cross_ring_vk *)cross_ring_handle;
+    vk_device dev = ring->device;
     if (!dev) return;
 
     vk::FenceCreateInfo fence_info;
-    vk::Fence fence = dev->device.createFence(fence_info);
+    vk::Fence fence = ring->vkdev.createFence(fence_info);
 
-    vk::CommandBufferAllocateInfo cmd_buf_info(dev->transfer_queue.cmd_pool.pool, vk::CommandBufferLevel::ePrimary, 1);
-    vk::CommandBuffer cmd = dev->device.allocateCommandBuffers(cmd_buf_info)[0];
+    vk::CommandBufferAllocateInfo cmd_buf_info(ring->command_pool, vk::CommandBufferLevel::ePrimary, 1);
+    vk::CommandBuffer cmd = ring->vkdev.allocateCommandBuffers(cmd_buf_info)[0];
 
     vk::CommandBufferBeginInfo begin_info(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
     cmd.begin(begin_info);
 
     vk::BufferCopy copy_region(0, offset, size);
-    VkBuffer src_buf = reinterpret_cast<VkBuffer>(reinterpret_cast<uintptr_t>(d_src));
-    VkBuffer dst_buf = reinterpret_cast<VkBuffer>(reinterpret_cast<uintptr_t>(d_dst));
-    cmd.copyBuffer(src_buf, dst_buf, copy_region);
+    vk::Buffer src_buf = vk::Buffer(reinterpret_cast<VkBuffer>(reinterpret_cast<uintptr_t>(d_src)));
+    cmd.copyBuffer(src_buf, ring->ring_buffer, copy_region);
 
     cmd.end();
 
     vk::SubmitInfo submit_info({}, {}, cmd);
-    dev->transfer_queue.queue.submit(submit_info, fence);
-    VK_CHECK(dev->device.waitForFences(fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor waitForFences");
+    ring->queue.submit(submit_info, fence);
+    VK_CHECK(ring->vkdev.waitForFences(fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor waitForFences");
 
-    dev->device.freeCommandBuffers(dev->transfer_queue.cmd_pool.pool, cmd);
-    dev->device.destroyFence(fence);
+    ring->vkdev.freeCommandBuffers(ring->command_pool, cmd);
+    ring->vkdev.destroyFence(fence);
 }
 
 extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cross_ring_handle, size_t src_offset, size_t size) {
@@ -16589,6 +16622,9 @@ static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const cha
     UNUSED(reg);
     if (strcmp(name, "dflash_cross_ring_gpu_alloc") == 0) {
         return (void *)dflash_cross_ring_vk_alloc;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_find_device_idx") == 0) {
+        return (void *)dflash_cross_ring_vk_find_device_idx;
     }
     if (strcmp(name, "dflash_cross_ring_gpu_free") == 0) {
         return (void *)dflash_cross_ring_vk_free;

@@ -4713,34 +4713,43 @@ struct dflash_cross_ring_handle {
 
 void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_size) {
     ggml_backend_reg_t gpu_reg = nullptr;
+    const char * gpu_dev_name = nullptr;
     for (auto & backend : backends) {
         auto * dev = ggml_backend_get_device(backend.get());
         if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
             gpu_reg = ggml_backend_dev_backend_reg(dev);
+            gpu_dev_name = ggml_backend_dev_name(dev);
             break;
         }
     }
     if (!gpu_reg) return nullptr;
 
-    using alloc_fn_t      = void * (*)(int, int, int);
+    using alloc_fn_t      = void * (*)(int, int, int, int);
+    using find_dev_fn_t   = int (*)(const char *);
     using free_fn_t       = void   (*)(void *);
     using write_fn_t      = void   (*)(void *, int, int, const float *, int, int);
     using interleave_fn_t = const float * (*)(void *, int, int, int);
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
     using set_tensor_d2d_fn_t = void (*)(struct ggml_tensor *, void *, size_t, size_t);
 
-    auto fn_alloc          = (alloc_fn_t)          ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_alloc");
-    auto fn_free           = (free_fn_t)           ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_free");
-    auto fn_write          = (write_fn_t)          ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_write");
-    auto fn_interleave     = (interleave_fn_t)     ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_interleave");
-    auto fn_set_tensor     = (set_tensor_fn_t)     ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor");
+    auto fn_find_dev      = (find_dev_fn_t)       ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_find_device_idx");
+    auto fn_alloc         = (alloc_fn_t)           ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_alloc");
+    auto fn_free          = (free_fn_t)            ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_free");
+    auto fn_write         = (write_fn_t)           ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_write");
+    auto fn_interleave    = (interleave_fn_t)      ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_interleave");
+    auto fn_set_tensor    = (set_tensor_fn_t)      ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor");
     auto fn_set_tensor_d2d = (set_tensor_d2d_fn_t) ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor_d2d");
 
     if (!fn_alloc || !fn_free || !fn_write || !fn_interleave || !fn_set_tensor) {
         return nullptr;
     }
 
-    void * gpu_ring = fn_alloc(n_layers, n_embd, ring_size);
+    int device_idx = -1;
+    if (fn_find_dev && gpu_dev_name) {
+        device_idx = fn_find_dev(gpu_dev_name);
+    }
+
+    void * gpu_ring = fn_alloc(n_layers, n_embd, ring_size, device_idx);
     if (!gpu_ring) return nullptr;
 
     auto * handle = new dflash_cross_ring_handle();
@@ -5276,7 +5285,7 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
         ggml_backend_dev_memory(dev, &free, &total);
 
         const size_t self = mb.model + mb.context + mb.compute;
-        const size_t unaccounted = total - self - free;
+        const size_t unaccounted = (total > self + free) ? (total - self - free) : 0;
 
         table_data.push_back({
             template_gpu,
