@@ -1,0 +1,59 @@
+#version 450
+
+#include "types.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint32_t M;
+    uint32_t N;
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t ne02;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+} p;
+
+const float tq3_centroids[8] = float[8](
+    -2.1519454, -1.3439092, -0.7560052, -0.2450942,
+     0.2450942,  0.7560052,  1.3439092,  2.1519454
+);
+
+void main() {
+    const uint idx = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.x / 64u;
+    if (idx >= p.M) return;
+
+    const uint ib = idx / (QUANT_K / 2);
+    const uint iqs = (idx % (QUANT_K / 2)) * 2;
+
+    const float d = float(data_a[ib].d);
+
+    const uint group0 = iqs / 8u;
+    const uint within0 = iqs % 8u;
+    const uint base0 = group0 * 3u;
+    const uint group1 = (iqs + 1u) / 8u;
+    const uint within1 = (iqs + 1u) % 8u;
+    const uint base1 = group1 * 3u;
+
+    uint b0_0 = uint(data_a[ib].qs[base0 + 0]);
+    uint b1_0 = uint(data_a[ib].qs[base0 + 1]);
+    uint b2_0 = uint(data_a[ib].qs[base0 + 2]);
+    uint bits24_0 = b0_0 | (b1_0 << 8) | (b2_0 << 16);
+    uint ci0 = (bits24_0 >> (within0 * 3u)) & 7u;
+
+    uint b0_1 = uint(data_a[ib].qs[base1 + 0]);
+    uint b1_1 = uint(data_a[ib].qs[base1 + 1]);
+    uint b2_1 = uint(data_a[ib].qs[base1 + 2]);
+    uint bits24_1 = b0_1 | (b1_1 << 8) | (b2_1 << 16);
+    uint ci1 = (bits24_1 >> (within1 * 3u)) & 7u;
+
+    data_d[idx] = D_TYPE(d * tq3_centroids[ci0]);
+    if (idx + 1 < p.M) {
+        data_d[idx + 1] = D_TYPE(d * tq3_centroids[ci1]);
+    }
+}

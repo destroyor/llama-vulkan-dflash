@@ -1,0 +1,51 @@
+#version 450
+
+#include "types.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint32_t M;
+    uint32_t N;
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t ne02;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t nb02;
+    uint32_t nb03;
+} p;
+
+const float turbo4_centroids[16] = float[16](
+    -0.241556, -0.182907, -0.143047, -0.111065,
+    -0.083317, -0.058069, -0.034311, -0.011353,
+     0.011353,  0.034311,  0.058069,  0.083317,
+     0.111065,  0.143047,  0.182907,  0.241556
+);
+
+void main() {
+    const uint idx = gl_WorkGroupID.x * 4u + gl_LocalInvocationID.x / 64u;
+    if (idx >= p.M) return;
+
+    const uint ib = idx / (QUANT_K / 2);
+    const uint iqs = (idx % (QUANT_K / 2)) * 2;
+
+    const float d = float(data_a[ib].d);
+
+    const uint byte_idx0 = iqs / 2;
+    const uint8_t byte_val0 = data_a[ib].qs[byte_idx0];
+    const uint ci0 = (iqs & 1u) == 0u ? uint(byte_val0 & 0xFu) : uint(byte_val0 >> 4);
+
+    const uint iqs1 = iqs + 1;
+    const uint byte_idx1 = iqs1 / 2;
+    const uint8_t byte_val1 = data_a[ib].qs[byte_idx1];
+    const uint ci1 = (iqs1 & 1u) == 0u ? uint(byte_val1 & 0xFu) : uint(byte_val1 >> 4);
+
+    data_d[idx] = D_TYPE(d * turbo4_centroids[ci0]);
+    if (idx + 1 < p.M) {
+        data_d[idx + 1] = D_TYPE(d * turbo4_centroids[ci1]);
+    }
+}

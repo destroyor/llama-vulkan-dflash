@@ -1,0 +1,220 @@
+#version 450
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#define FLT_MAX 3.402823466e+38F
+#define MAX_K 32
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared FLOAT_TYPE s_heap_val[MAX_K * 32];
+shared int s_heap_idx[MAX_K * 32];
+shared FLOAT_TYPE s_logit_max[32];
+shared FLOAT_TYPE s_sum_exp[32];
+
+uint philox_hash(uint s_lo, uint s_hi, uint counter) {
+    uint lo = counter;
+    uint hi = 0u;
+    uint k0 = s_lo;
+    uint k1 = s_hi;
+    for (int i = 0; i < 4; i++) {
+        uint prod_lo = lo * 0xD2511F53u;
+        lo = (prod_lo ^ hi ^ k0);
+        hi = prod_lo;
+        k0 += 0x9E3779B9u;
+        k1 += 0xBB67AE85u;
+    }
+    return lo;
+}
+
+float gumbel_noise(uint row, uint col) {
+    uint h = philox_hash(floatBitsToUint(p.param2), floatBitsToUint(p.param3), uint(row * p.KX + col));
+    float u = ((h >> 8u) + 0.5) * (1.0 / 16777216.0);
+    return -log(-log(u));
+}
+
+void sift_down(inout FLOAT_TYPE hv[MAX_K], inout int hi[MAX_K], int pos, int k) {
+    while (true) {
+        int left = 2 * pos + 1;
+        int right = 2 * pos + 2;
+        int smallest = pos;
+        if (left < k && hv[left] < hv[smallest]) smallest = left;
+        if (right < k && hv[right] < hv[smallest]) smallest = right;
+        if (smallest == pos) break;
+        FLOAT_TYPE tv = hv[pos]; hv[pos] = hv[smallest]; hv[smallest] = tv;
+        int ti = hi[pos]; hi[pos] = hi[smallest]; hi[smallest] = ti;
+        pos = smallest;
+    }
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.KY) return;
+
+    const bool use_gumbel = (floatBitsToUint(p.param2) != 0u || floatBitsToUint(p.param3) != 0u);
+    const int k = int(p.param4);
+
+    FLOAT_TYPE heap_val[MAX_K];
+    int heap_idx[MAX_K];
+    for (int i = 0; i < k; i++) {
+        heap_val[i] = FLOAT_TYPE(-FLT_MAX);
+        heap_idx[i] = -1;
+    }
+
+    FLOAT_TYPE logit_max = FLOAT_TYPE(-FLT_MAX);
+    FLOAT_TYPE sum_exp = FLOAT_TYPE(0.0);
+
+    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+        FLOAT_TYPE scaled = FLOAT_TYPE(data_a[row * p.KX + i]) * p.param1;
+
+        if (scaled > logit_max) {
+            sum_exp = sum_exp * exp(logit_max - scaled) + FLOAT_TYPE(1.0);
+            logit_max = scaled;
+        } else {
+            sum_exp += exp(scaled - logit_max);
+        }
+
+        FLOAT_TYPE val = scaled;
+        if (use_gumbel) {
+            val += FLOAT_TYPE(gumbel_noise(row, i));
+        }
+
+        if (val > heap_val[0]) {
+            heap_val[0] = val;
+            heap_idx[0] = int(i);
+            sift_down(heap_val, heap_idx, 0, k);
+        }
+    }
+
+    const uint subgroup_id = gl_SubgroupID;
+    const uint subgroup_cnt = gl_NumSubgroups;
+    const uint lane = gl_SubgroupInvocationID;
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        for (int i = 0; i < k; i++) {
+            FLOAT_TYPE partner_val = subgroupShuffleXor(heap_val[i], offset);
+            int partner_idx = subgroupShuffleXor(heap_idx[i], offset);
+            if (partner_val > heap_val[0]) {
+                heap_val[0] = partner_val;
+                heap_idx[0] = partner_idx;
+                sift_down(heap_val, heap_idx, 0, k);
+            }
+        }
+    }
+
+    FLOAT_TYPE other_logit_max = subgroupShuffleXor(logit_max, 16);
+    FLOAT_TYPE other_sum_exp = subgroupShuffleXor(sum_exp, 16);
+    if (other_logit_max > logit_max) {
+        sum_exp = sum_exp * exp(logit_max - other_logit_max) + other_sum_exp;
+        logit_max = other_logit_max;
+    } else {
+        sum_exp = sum_exp + other_sum_exp * exp(other_logit_max - logit_max);
+    }
+    other_logit_max = subgroupShuffleXor(logit_max, 8);
+    other_sum_exp = subgroupShuffleXor(sum_exp, 8);
+    if (other_logit_max > logit_max) {
+        sum_exp = sum_exp * exp(logit_max - other_logit_max) + other_sum_exp;
+        logit_max = other_logit_max;
+    } else {
+        sum_exp = sum_exp + other_sum_exp * exp(other_logit_max - logit_max);
+    }
+    other_logit_max = subgroupShuffleXor(logit_max, 4);
+    other_sum_exp = subgroupShuffleXor(sum_exp, 4);
+    if (other_logit_max > logit_max) {
+        sum_exp = sum_exp * exp(logit_max - other_logit_max) + other_sum_exp;
+        logit_max = other_logit_max;
+    } else {
+        sum_exp = sum_exp + other_sum_exp * exp(other_logit_max - logit_max);
+    }
+    other_logit_max = subgroupShuffleXor(logit_max, 2);
+    other_sum_exp = subgroupShuffleXor(sum_exp, 2);
+    if (other_logit_max > logit_max) {
+        sum_exp = sum_exp * exp(logit_max - other_logit_max) + other_sum_exp;
+        logit_max = other_logit_max;
+    } else {
+        sum_exp = sum_exp + other_sum_exp * exp(other_logit_max - logit_max);
+    }
+    other_logit_max = subgroupShuffleXor(logit_max, 1);
+    other_sum_exp = subgroupShuffleXor(sum_exp, 1);
+    if (other_logit_max > logit_max) {
+        sum_exp = sum_exp * exp(logit_max - other_logit_max) + other_sum_exp;
+        logit_max = other_logit_max;
+    } else {
+        sum_exp = sum_exp + other_sum_exp * exp(other_logit_max - logit_max);
+    }
+
+    if (subgroup_cnt > 1) {
+        if (lane == 0u) {
+            for (int i = 0; i < k; i++) {
+                s_heap_val[subgroup_id * MAX_K + i] = heap_val[i];
+                s_heap_idx[subgroup_id * MAX_K + i] = heap_idx[i];
+            }
+            s_logit_max[subgroup_id] = logit_max;
+            s_sum_exp[subgroup_id] = sum_exp;
+        }
+        barrier();
+
+        if (subgroup_id == 0u && lane == 0u) {
+            for (uint w = 1u; w < subgroup_cnt; w++) {
+                for (int i = 0; i < k; i++) {
+                    FLOAT_TYPE cand_val = s_heap_val[w * MAX_K + i];
+                    int cand_idx = s_heap_idx[w * MAX_K + i];
+                    if (cand_val > heap_val[0]) {
+                        heap_val[0] = cand_val;
+                        heap_idx[0] = cand_idx;
+                        sift_down(heap_val, heap_idx, 0, k);
+                    }
+                }
+                FLOAT_TYPE other_max = s_logit_max[w];
+                FLOAT_TYPE other_sum = s_sum_exp[w];
+                if (other_max > logit_max) {
+                    sum_exp = sum_exp * exp(logit_max - other_max) + other_sum;
+                    logit_max = other_max;
+                } else {
+                    sum_exp = sum_exp + other_sum * exp(other_max - logit_max);
+                }
+            }
+        }
+    }
+
+    if ((subgroup_cnt == 1u && lane == 0u) || (subgroup_cnt > 1u && subgroup_id == 0u && lane == 0u)) {
+        for (int i = 1; i < k; i++) {
+            FLOAT_TYPE kv = heap_val[i];
+            int ki = heap_idx[i];
+            int j = i - 1;
+            while (j >= 0 && heap_val[j] < kv) {
+                heap_val[j + 1] = heap_val[j];
+                heap_idx[j + 1] = heap_idx[j];
+                j--;
+            }
+            heap_val[j + 1] = kv;
+            heap_idx[j + 1] = ki;
+        }
+
+        for (int i = 0; i < k; i++) {
+            data_d[row * uint(k) + uint(i)] = D_TYPE(heap_idx[i]);
+        }
+
+        FLOAT_TYPE log_norm = logit_max + log(sum_exp);
+        for (int i = 0; i < k; i++) {
+            FLOAT_TYPE log_prob = (heap_idx[i] >= 0) ?
+                (FLOAT_TYPE(data_a[row * p.KX + uint(heap_idx[i])]) * p.param1 - log_norm) :
+                FLOAT_TYPE(-FLT_MAX);
+            int prob_bits = floatBitsToInt(float(log_prob));
+            data_d[uint(k) * p.KY + row * uint(k) + uint(i)] = D_TYPE(prob_bits);
+        }
+    }
+}

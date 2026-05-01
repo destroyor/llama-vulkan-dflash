@@ -1,0 +1,33 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint ring_size;
+    uint read_start;
+    uint cross_len;
+    uint n_layers;
+    uint n_embd;
+    uint layer_ring_offset;
+};
+
+layout(binding = 0) readonly buffer RingBuf  { FLOAT_TYPE data_ring[];  };
+layout(binding = 1) writeonly buffer OutBuf  { FLOAT_TYPE data_out[];   };
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint t = gl_WorkGroupID.x;
+    const uint l = gl_WorkGroupID.y;
+
+    if (t >= cross_len || l >= n_layers) return;
+
+    const uint slot = (read_start + t) % ring_size;
+    const uint src_off = l * layer_ring_offset + slot * n_embd;
+    const uint dst_off = t * n_layers * n_embd + l * n_embd;
+
+    [[unroll]] for (uint i = tid; i < n_embd; i += 256u) {
+        data_out[dst_off + i] = data_ring[src_off + i];
+    }
+}

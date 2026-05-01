@@ -1,0 +1,114 @@
+#version 450
+#include "generic_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#define FLT_MAX 3.402823466e+38F
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+
+shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
+shared uint tmpidx[BLOCK_SIZE];
+shared FLOAT_TYPE tmp_logit_max[BLOCK_SIZE];
+shared FLOAT_TYPE tmp_sum_exp[BLOCK_SIZE];
+
+uint philox_hash(uint s_lo, uint s_hi, uint counter) {
+    uint lo = counter;
+    uint hi = 0u;
+    uint k0 = s_lo;
+    uint k1 = s_hi;
+    for (int i = 0; i < 4; i++) {
+        uint prod_lo = lo * 0xD2511F53u;
+        lo = (prod_lo ^ hi ^ k0);
+        hi = prod_lo;
+        k0 += 0x9E3779B9u;
+        k1 += 0xBB67AE85u;
+    }
+    return lo;
+}
+
+float gumbel_noise(uint row, uint col) {
+    uint h = philox_hash(floatBitsToUint(p.param2), floatBitsToUint(p.param3), uint(row * p.KX + col));
+    float u = ((h >> 8u) + 0.5) * (1.0 / 16777216.0);
+    return -log(-log(u));
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+
+    if (row >= p.KY) return;
+
+    const bool use_gumbel = (floatBitsToUint(p.param2) != 0u || floatBitsToUint(p.param3) != 0u);
+    const bool output_logprob = (p.param1 != 1.0) || (int(p.param4) > 1);
+
+    FLOAT_TYPE maxval = FLOAT_TYPE(-FLT_MAX);
+    uint argmax_idx = 0u;
+    FLOAT_TYPE logit_max = FLOAT_TYPE(-FLT_MAX);
+    FLOAT_TYPE sum_exp = FLOAT_TYPE(0.0);
+
+    for (uint i = tid; i < p.KX; i += BLOCK_SIZE) {
+        FLOAT_TYPE scaled = FLOAT_TYPE(data_a[row * p.KX + i]) * p.param1;
+
+        if (output_logprob) {
+            if (scaled > logit_max) {
+                sum_exp = sum_exp * exp(logit_max - scaled) + FLOAT_TYPE(1.0);
+                logit_max = scaled;
+            } else {
+                sum_exp += exp(scaled - logit_max);
+            }
+        }
+
+        FLOAT_TYPE val = scaled;
+        if (use_gumbel) {
+            val += FLOAT_TYPE(gumbel_noise(row, i));
+        }
+        if (val > maxval) {
+            maxval = val;
+            argmax_idx = i;
+        }
+    }
+
+    tmpmax[tid] = maxval;
+    tmpidx[tid] = argmax_idx;
+    tmp_logit_max[tid] = logit_max;
+    tmp_sum_exp[tid] = sum_exp;
+
+    barrier();
+    [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
+        if (int(tid) < s && tid + uint(s) < p.KX) {
+            if (tmpmax[tid] < tmpmax[tid + uint(s)]) {
+                tmpmax[tid] = tmpmax[tid + uint(s)];
+                tmpidx[tid] = tmpidx[tid + uint(s)];
+            }
+            if (output_logprob) {
+                FLOAT_TYPE other_max = tmp_logit_max[tid + uint(s)];
+                FLOAT_TYPE other_sum = tmp_sum_exp[tid + uint(s)];
+                if (other_max > tmp_logit_max[tid]) {
+                    tmp_sum_exp[tid] = tmp_sum_exp[tid] * exp(tmp_logit_max[tid] - other_max) + other_sum;
+                    tmp_logit_max[tid] = other_max;
+                } else {
+                    tmp_sum_exp[tid] = tmp_sum_exp[tid] + other_sum * exp(other_max - tmp_logit_max[tid]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        data_d[row] = D_TYPE(tmpidx[0]);
+        if (output_logprob) {
+            FLOAT_TYPE log_prob = FLOAT_TYPE(data_a[row * p.KX + tmpidx[0]]) * p.param1 - tmp_logit_max[0] - log(tmp_sum_exp[0]);
+            int prob_bits = floatBitsToInt(float(log_prob));
+            data_d[p.KY + row] = D_TYPE(prob_bits);
+        } else {
+            data_d[p.KY + row] = D_TYPE(0);
+        }
+    }
+}

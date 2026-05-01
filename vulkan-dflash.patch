@@ -1,0 +1,110 @@
+# Vulkan DFlash + TurboQuant 移植变更清单
+
+本文件记录了 llama-vulkan-dflash 仓库相对于 buun-llama-cpp 上游的所有修改。
+
+由于 buun-llama-cpp 不是 git 仓库，无法生成 git diff 补丁。以下为完整的变更文件清单和修改说明。
+
+---
+
+## 新建文件（Vulkan 移植新增）
+
+| 文件路径 | 说明 |
+|---------|------|
+| `ggml/src/ggml-vulkan/vulkan-shaders/gated_delta_net_tree.comp` | 树形 GDN 着色器，9 binding (Q/K/V/G/Beta/State/Parent/Inter/Dst) |
+| `ggml/src/ggml-vulkan/vulkan-shaders/argmax_ext.comp` | 扩展 argmax，支持 inv_temp + Gumbel 噪声 + log-prob |
+| `ggml/src/ggml-vulkan/vulkan-shaders/topk_ext.comp` | GPU top-K，最小堆 + subgroup shuffle 合并 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/cross_ring_interleave.comp` | Cross-ring 交错输出着色器 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/dequant_tq3_0.comp` | TQ3_0 独立反量化着色器 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/dequant_turbo4_0.comp` | TURBO4_0 独立反量化着色器 |
+
+---
+
+## 修改文件清单
+
+### CPU 端（TQ3_0 类型注册）
+
+| 文件 | 修改内容 |
+|------|---------|
+| `ggml/include/ggml.h` | 添加 `GGML_TYPE_TQ3_0 = 46` 枚举 |
+| `ggml/src/ggml-common.h` | 添加 `block_tq3_0` 结构体 |
+| `ggml/src/ggml-quants.c` | 添加 `quantize_row_tq3_0_ref` / `dequantize_row_tq3_0` |
+| `ggml/src/ggml-quants.h` | 添加 TQ3_0 函数声明 |
+| `ggml/src/ggml.c` | 添加 TQ3_0 type_traits + quantize_chunk case |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | 添加 TQ3_0 type_traits |
+| `ggml/src/ggml-cpu/quants.c` | 添加 `ggml_vec_dot_tq3_0_q8_0` |
+| `ggml/src/ggml-cpu/quants.h` | 添加 TQ3_0 函数声明 |
+
+### Vulkan 着色器（TQ3_0 + TURBO4_0）
+
+| 文件 | 修改内容 |
+|------|---------|
+| `vulkan-shaders/types.glsl` | 添加 `block_tq3_0` + `block_turbo4_0` 及 packed16 版本 |
+| `vulkan-shaders/dequant_funcs.glsl` | 添加 TQ3_0 + TURBO4_0 的 `dequantize()` / `dequantize4()` |
+| `vulkan-shaders/dequant_funcs_cm2.glsl` | 添加 TQ3_0 + TURBO4_0 的 CoopMat2 反量化函数 |
+| `vulkan-shaders/flash_attn_base.glsl` | 添加 TQ3_0 + TURBO4_0 的 FA `dequantize4()` |
+| `vulkan-shaders/copy_to_quant.comp` | 添加 TQ3_0 + TURBO4_0 的 GPU 端量化 |
+| `vulkan-shaders/vulkan-shaders-gen.cpp` | 注册 tq3_0 + turbo4_0 + tree + argmax_ext + topk_ext + cross_ring |
+
+### Vulkan 后端注册（ggml-vulkan.cpp）
+
+| 修改类别 | 内容 |
+|---------|------|
+| Pipeline 声明 | `pipeline_gated_delta_net_tree[3][2]`, `pipeline_argmax_ext_f32`, `pipeline_topk_ext_f32`, `pipeline_cross_ring_interleave_f32` |
+| Push constants | `vk_op_cross_ring_push_constants` 结构体 |
+| Pipeline 创建 | TQ3_0 + TURBO4_0 所有 pipeline + GDN tree + argmax_ext + topk_ext + cross_ring |
+| Dispatch 函数 | `ggml_vk_gated_delta_net_tree`, `ggml_vk_argmax_ext`, `ggml_vk_topk_ext` |
+| Switch case | `GGML_OP_GATED_DELTA_NET_TREE` (op_get_pipeline, supports_op, build_graph, check_results) |
+| ARGMAX 扩展 | `GGML_OP_ARGMAX` 在 op_get_pipeline 中根据 temp/seed 选择 argmax_ext |
+| Cross-Ring | `dflash_cross_ring_vk_*` 函数族 (alloc/free/write/interleave/set_tensor) |
+| get_proc_address | `ggml_backend_vk_get_proc_address` 导出 5 个 DFlash cross-ring 函数 |
+
+### DFlash 适配
+
+| 文件 | 修改内容 |
+|------|---------|
+| `src/llama-context.cpp` | `init_cross_ring_gpu` 从硬编码 CUDA 改为查找任意 GPU 后端 (`cuda_reg` → `gpu_reg`) |
+
+### 命令行参数
+
+| 文件 | 修改内容 |
+|------|---------|
+| `common/arg.cpp` | `kv_cache_types` 仅保留 q8_0、tq3_0、turbo4（精简版） |
+
+---
+
+## 升级方法
+
+当 buun-llama-cpp 上游更新时：
+
+1. 获取上游新版本源码
+2. 按上述文件清单逐一检查修改点是否仍存在
+3. 如果上游修改了同一位置，需要手动合并
+4. 重点关注 `ggml-vulkan.cpp`（修改量最大，~100+ 处）
+5. 着色器文件修改为追加式（`#if defined(DATA_A_XXX)` 块），冲突概率较低
+6. 详细升级指南见 `PORTING.md` 第 5 节和第 8.7 节
+
+---
+
+## 编译命令
+
+```bash
+cd /path/to/llama-vulkan-dflash
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target llama-server -j$(nproc)
+```
+
+## 测试命令
+
+```bash
+# TQ3_0 KV 缓存
+./build/bin/llama-server -m /path/to/model.gguf -ngl 99 -ctk tq3_0 -ctv tq3_0
+
+# TURBO4 KV 缓存
+./build/bin/llama-server -m /path/to/model.gguf -ngl 99 -ctk turbo4 -ctv turbo4
+
+# DFlash 推测解码
+./build/bin/llama-server -m /path/to/model.gguf -ngl 99 --spec-type dflash
+
+# 指定 Vulkan 设备
+GGML_VK_VISIBLE_DEVICES=0 ./build/bin/llama-server ...  # 7900 XTX
+```
