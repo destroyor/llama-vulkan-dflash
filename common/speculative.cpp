@@ -147,6 +147,10 @@ struct common_speculative_state {
 
     virtual ~common_speculative_state() = default;
 
+    virtual bool is_disabled() const { return false; }
+
+    virtual void tick() {}
+
     virtual void begin(const llama_tokens & prompt) = 0;
 
     virtual void draft(
@@ -1247,6 +1251,16 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // GPU cross-attention ring (nullptr = CPU fallback)
     void * gpu_ring_handle = nullptr;
 
+    int n_low_streak = 0;
+    bool disabled = false;
+    int cooldown_tokens = 0;
+    static constexpr int LOW_STREAK_THRESHOLD = 2;
+    static constexpr float LOW_ACCEPT_THRESHOLD = 0.50f;
+    static constexpr int COOLDOWN_TOKEN_COUNT = 64;
+    int n_draft_last = 0;
+    float accept_rate_ema = 1.0f;
+    static constexpr float EMA_ALPHA = 0.3f;
+
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
         if (gpu_ring_handle) {
@@ -1326,6 +1340,21 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
     void set_seq_id(llama_seq_id seq_id_) override {
         seq_id = seq_id_;
+    }
+
+    bool is_disabled() const override { return disabled; }
+
+    void tick() override {
+        if (disabled) {
+            cooldown_tokens++;
+            if (cooldown_tokens >= COOLDOWN_TOKEN_COUNT) {
+                disabled = false;
+                cooldown_tokens = 0;
+                n_low_streak = 0;
+                accept_rate_ema = 1.0f;
+                LOG_INF("dflash adaptive: re-enabling after cooldown (%d tokens)\n", COOLDOWN_TOKEN_COUNT);
+            }
+        }
     }
 
     // prepare cross-attention data for batched draft decode.
@@ -1474,6 +1503,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
             std::vector<float> * draft_log_probs = nullptr) override {
         GGML_UNUSED(prompt_tgt);
 
+        if (disabled) {
+            result.clear();
+            n_draft_last = 0;
+            return;
+        }
+
         const int n_draft = std::min(block_size - 1, params.n_max);
         if (committed_len == 0) {
             return;
@@ -1541,10 +1576,29 @@ struct common_speculative_state_dflash : public common_speculative_state {
         LOG_DBG("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
                 committed_len,
                 (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
+
+        n_draft_last = (int)result.size();
     }
 
     void accept(uint16_t n_accepted) override {
-        GGML_UNUSED(n_accepted);
+        if (disabled) {
+            return;
+        }
+        if (n_draft_last > 0) {
+            float acceptance_rate = (float)n_accepted / (float)n_draft_last;
+            accept_rate_ema = EMA_ALPHA * acceptance_rate + (1.0f - EMA_ALPHA) * accept_rate_ema;
+            if (acceptance_rate < LOW_ACCEPT_THRESHOLD) {
+                n_low_streak++;
+                if (n_low_streak >= LOW_STREAK_THRESHOLD || accept_rate_ema < LOW_ACCEPT_THRESHOLD * 0.6f) {
+                    disabled = true;
+                    cooldown_tokens = 0;
+                    LOG_WRN("dflash adaptive: disabling due to low acceptance (streak=%d, rate=%.1f%%, ema=%.1f%%)\n",
+                            n_low_streak, 100.0f * acceptance_rate, 100.0f * accept_rate_ema);
+                }
+            } else {
+                n_low_streak = 0;
+            }
+        }
     }
 
     void draft_tree(
@@ -1553,6 +1607,20 @@ struct common_speculative_state_dflash : public common_speculative_state {
             llama_token id_last,
             int tree_budget,
             common_speculative_tree & tree) override {
+        GGML_UNUSED(prompt_tgt);
+
+        if (disabled) {
+            tree.tokens.clear();
+            tree.parents.clear();
+            tree.depths.clear();
+            tree.child_maps.clear();
+            tree.visibility.clear();
+            tree.n_nodes = 0;
+            tree.main_path_len = 0;
+            n_draft_last = 0;
+            return;
+        }
+
         const int n_draft = std::min((int) params.n_max, block_size - 1);
         if (n_draft <= 0 || committed_len == 0) {
             return;
@@ -1714,15 +1782,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 tree_budget, (t1 - t0) / 1e3);
 
         GGML_UNUSED(prompt_tgt);
+
+        n_draft_last = tree.n_nodes;
     }
 
     // called after target verification decode — capture and append new hidden states
     void update_logits(llama_context * ctx, const llama_tokens & batch_tokens, int n_accepted) override {
         GGML_UNUSED(ctx);
         GGML_UNUSED(batch_tokens);
-        // n_accepted includes the bonus token: [id_last, draft0, ..., draftN-1] → accepted count
-        // the verification batch had (1 + n_draft) tokens
-        // only the first n_accepted tokens' hidden states should be kept
+        if (disabled) {
+            return;
+        }
         append_target_hiddens(n_accepted);
     }
 
@@ -2503,5 +2573,26 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_perf.c_str(),
                 str_ext.c_str());
+    }
+}
+
+bool common_speculative_is_disabled(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->is_disabled()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void common_speculative_tick(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->tick();
     }
 }

@@ -339,7 +339,7 @@ struct common_params_speculative {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding          // NOLINT
 
     // copyspec: copy from context
-    int32_t copyspec_gamma      = 6;    // window size for rolling hash match
+    int32_t copyspec_gamma      = 15;
 
     // token recycling: adjacency matrix
     int32_t recycle_k            = 8;    // top-k successors per token

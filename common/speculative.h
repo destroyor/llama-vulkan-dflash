@@ -107,3 +107,9 @@ common_speculative_tree common_speculative_draft_tree(
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// check if the speculative decoder is currently disabled (adaptive fallback)
+bool common_speculative_is_disabled(const common_speculative * spec);
+
+// tick the speculative decoder (advance cooldown when disabled)
+void common_speculative_tick(common_speculative * spec);

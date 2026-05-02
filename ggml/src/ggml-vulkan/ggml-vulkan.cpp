@@ -13740,7 +13740,14 @@ static void ggml_vk_get_device_description(int device, char * description, size_
 // device backend
 
 static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer) {
+    if (!buffer || !buffer->buft || !buffer->buft->iface.get_name) return false;
     return buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name;
+}
+
+static bool ggml_backend_buffer_is_vk_or_host(ggml_backend_buffer_t buffer) {
+    if (!buffer || !buffer->buft || !buffer->buft->iface.get_name) return false;
+    const char * name = buffer->buft->iface.get_name(buffer->buft);
+    return strcmp(name, GGML_VK_NAME) == 0 || strcmp(name, GGML_VK_NAME "_Host") == 0;
 }
 
 static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -14001,6 +14008,49 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     }
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+    vk_buffer buf = buf_ctx->dev_buffer;
+    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+
+        VK_LOG_DEBUG("[ReBAR-Bypass] direct host write for tensor " << tensor->name << ", size " << size);
+
+        static int rebbar_bypass_count = 0;
+        if (rebbar_bypass_count < 5) {
+            fprintf(stderr, "[ReBAR-Bypass] direct host write for tensor %s, size %zu\n", tensor->name ? tensor->name : "?", size);
+            rebbar_bypass_count++;
+        }
+
+        memcpy((uint8_t *)buf->ptr + dst_offset, data, size);
+
+        vk_context barrier_ctx;
+        if (ctx->device->async_use_transfer_queue) {
+            if (ctx->transfer_ctx.expired()) {
+                barrier_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
+                ctx->transfer_ctx = barrier_ctx;
+                ggml_vk_ctx_begin(ctx->device, barrier_ctx);
+            } else {
+                barrier_ctx = ctx->transfer_ctx.lock();
+            }
+        } else {
+            barrier_ctx = ggml_vk_get_compute_ctx(ctx);
+        }
+
+        barrier_ctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eHost,
+            vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+            {},
+            { {
+                { vk::AccessFlagBits::eHostWrite },
+                { vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eTransferRead }
+            } },
+            {},
+            {}
+        );
+
+        return;
+    }
 
     vk_context cpy_ctx;
 
@@ -14016,10 +14066,6 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     } else {
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
     }
-
-    vk_buffer buf = buf_ctx->dev_buffer;
-
-    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
     bool ret = ggml_vk_buffer_write_async(cpy_ctx, buf, dst_offset, data, size);
 
@@ -16310,6 +16356,8 @@ struct dflash_cross_ring_vk {
     size_t ring_buffer_size;
     size_t staging_buffer_size;
     vk::Fence fence;
+    vk::CommandBuffer d2d_cmd;
+    vk::Fence d2d_fence;
 };
 
 static vk_device vk_get_first_device() {
@@ -16439,11 +16487,17 @@ extern "C" void * dflash_cross_ring_vk_alloc(int n_layers, int n_embd, int ring_
         dev->device.bindBufferMemory(ring->host_staging_buffer, ring->host_staging_memory, 0);
         ring->host_staging_ptr = dev->device.mapMemory(ring->host_staging_memory, 0, host_staging_size);
 
-        vk::CommandPoolCreateInfo pool_info({}, ring->queue_family_index);
+        vk::CommandPoolCreateInfo pool_info(vk::CommandPoolCreateFlagBits::eResetCommandBuffer, ring->queue_family_index);
         ring->command_pool = dev->device.createCommandPool(pool_info);
 
         vk::FenceCreateInfo fence_info;
         ring->fence = dev->device.createFence(fence_info);
+
+        vk::CommandBufferAllocateInfo d2d_cmd_info(ring->command_pool, vk::CommandBufferLevel::ePrimary, 1);
+        ring->d2d_cmd = ring->vkdev.allocateCommandBuffers(d2d_cmd_info)[0];
+
+        vk::FenceCreateInfo d2d_fence_info(vk::FenceCreateFlagBits::eSignaled);
+        ring->d2d_fence = ring->vkdev.createFence(d2d_fence_info);
 
         size_t total_mb = (ring->ring_buffer_size + ring->staging_buffer_size) / (1024 * 1024);
         fprintf(stderr, "dflash vk ring: allocated %d layers x %d slots x %d embd + staging (~%zu MB)\n",
@@ -16462,6 +16516,7 @@ extern "C" void dflash_cross_ring_vk_free(void * handle) {
     auto * ring = (dflash_cross_ring_vk *)handle;
     if (ring->host_staging_ptr) ring->vkdev.unmapMemory(ring->host_staging_memory);
     ring->vkdev.destroyFence(ring->fence);
+    ring->vkdev.destroyFence(ring->d2d_fence);
     ring->vkdev.destroyCommandPool(ring->command_pool);
     ring->vkdev.freeMemory(ring->host_staging_memory);
     ring->vkdev.destroyBuffer(ring->host_staging_buffer);
@@ -16589,6 +16644,14 @@ extern "C" void dflash_cross_ring_vk_set_tensor(void * cross_ring_handle, const 
 extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cross_ring_handle, size_t src_offset, size_t size) {
     if (!dst || !cross_ring_handle || size == 0) return;
 
+    {
+        const char * dst_buf_name = dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "null";
+        bool is_vk = dst->buffer ? ggml_backend_buffer_is_vk_or_host(dst->buffer) : false;
+        bool is_host = dst->buffer ? ggml_backend_buffer_is_host(dst->buffer) : false;
+        fprintf(stderr, "[DFlash-D2D] dst=%s buf=%s is_vk=%d is_host=%d size=%zu\n",
+                dst->name ? dst->name : "?", dst_buf_name, is_vk, is_host, size);
+    }
+
     auto * ring = (dflash_cross_ring_vk *)cross_ring_handle;
 
     if (dst->buffer && ggml_backend_buffer_is_vk(dst->buffer)) {
@@ -16596,24 +16659,49 @@ extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cr
         vk_buffer dst_vkbuf = buf_ctx->dev_buffer;
         size_t dst_offset = vk_tensor_offset(dst) + dst->view_offs;
 
-        vk::CommandBufferAllocateInfo cmd_buf_info(ring->command_pool, vk::CommandBufferLevel::ePrimary, 1);
-        vk::CommandBuffer cmd = ring->vkdev.allocateCommandBuffers(cmd_buf_info)[0];
+        VK_CHECK(ring->vkdev.waitForFences(ring->d2d_fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor_d2d prev fence");
+        ring->vkdev.resetFences(ring->d2d_fence);
+
+        ring->d2d_cmd.reset(vk::CommandBufferResetFlagBits::eReleaseResources);
 
         vk::CommandBufferBeginInfo begin_info(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-        cmd.begin(begin_info);
+        ring->d2d_cmd.begin(begin_info);
 
         vk::BufferCopy copy_region(src_offset, dst_offset, size);
-        cmd.copyBuffer(ring->staging_buffer, dst_vkbuf->buffer, copy_region);
+        ring->d2d_cmd.copyBuffer(ring->staging_buffer, dst_vkbuf->buffer, copy_region);
 
-        cmd.end();
+        vk::BufferMemoryBarrier barrier(
+            vk::AccessFlagBits::eTransferWrite,
+            vk::AccessFlagBits::eShaderRead,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            dst_vkbuf->buffer, dst_offset, size);
+        ring->d2d_cmd.pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eComputeShader,
+            {}, {}, barrier, {});
 
-        vk::SubmitInfo submit_info({}, {}, cmd);
-        ring->queue.submit(submit_info, ring->fence);
-        VK_CHECK(ring->vkdev.waitForFences(ring->fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor_d2d waitForFences");
-        ring->vkdev.resetFences(ring->fence);
-        ring->vkdev.freeCommandBuffers(ring->command_pool, cmd);
+        ring->d2d_cmd.end();
+
+        vk::SubmitInfo submit_info({}, {}, ring->d2d_cmd);
+        ring->queue.submit(submit_info, ring->d2d_fence);
     } else if (dst->buffer && ggml_backend_buffer_is_host(dst->buffer)) {
         const uint8_t * src_ptr = (const uint8_t *)ring->host_staging_ptr + src_offset;
+        {
+            const float * fsrc = (const float *)src_ptr;
+            const float * fdst = (const float *)dst->data;
+            size_t n_floats = size / sizeof(float);
+            double sum_src = 0, sum_dst = 0;
+            float max_src = -1e30f, min_src = 1e30f;
+            for (size_t i = 0; i < n_floats && i < 5120; ++i) {
+                sum_src += (double)fsrc[i];
+                if (fdst) sum_dst += (double)fdst[i];
+                if (fsrc[i] > max_src) max_src = fsrc[i];
+                if (fsrc[i] < min_src) min_src = fsrc[i];
+            }
+            fprintf(stderr, "[DFlash-D2D-Verify] src_sum=%.4f dst_sum=%.4f n_floats=%zu src_range=[%.4f,%.4f] %s\n",
+                    sum_src, sum_dst, n_floats, min_src, max_src,
+                    (sum_src == sum_dst) ? "BIT_EXACT" : "MISMATCH");
+        }
         ggml_backend_tensor_set(dst, src_ptr, 0, size);
     }
 }

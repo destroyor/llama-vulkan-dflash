@@ -18,6 +18,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <fstream>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -31,6 +32,22 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static int read_amd_gpu_busy_percent() {
+    for (int card = 0; card < 16; card++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/gpu_busy_percent", card);
+        std::ifstream ifs(path);
+        if (ifs.is_open()) {
+            int val = -1;
+            ifs >> val;
+            if (val >= 0 && val <= 100) {
+                return val;
+            }
+        }
+    }
+    return -1;
+}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -281,6 +298,10 @@ struct server_slot {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
+            return 0;
+        }
+
+        if (common_speculative_is_disabled(spec)) {
             return 0;
         }
 
@@ -2214,6 +2235,8 @@ private:
         int64_t t_verify_total = 0;
         int64_t t_accept_total = 0;
         int n_slots_drafted = 0;
+        int n_cycle_drafted = 0;
+        int n_cycle_accepted = 0;
 
         // DFlash: narrow the shared drafter graph when fewer than max slots are
         // actively drafting. When only 1 slot drafts, the graph builder uses
@@ -2314,6 +2337,7 @@ private:
                 } else {
                     // keep track of total number of drafted tokens tested
                     slot.n_draft_total += draft.size();
+                    n_cycle_drafted += draft.size();
 
                     if (needs_reeval) {
                         // DFlash: sync previous tape replay, set linear parent IDs for tree kernel
@@ -2361,6 +2385,8 @@ private:
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
 
                 slot.prompt.tokens.push_back(slot.sampled);
+
+                common_speculative_tick(slot.spec);
 
                 SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                         slot.n_ctx, slot.prompt.n_tokens(), slot.truncated);
@@ -3230,6 +3256,7 @@ private:
 
                 // update how many tokens out of those tested were accepted
                 slot.n_draft_accepted += ids.size() - 1;
+                n_cycle_accepted += ids.size() - 1;
 
                 // inform the speculative decoding about the number of accepted tokens
                 common_speculative_accept(slot.spec, ids.size() - 1);
@@ -3318,10 +3345,16 @@ private:
         if (n_slots_drafted > 0) {
             const int64_t t_cycle_total = ggml_time_us() - t_cycle_start;
             const int64_t t_other = t_cycle_total - t_draft_total - t_verify_total - t_accept_total;
-            SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms\n",
+            float cycle_accept_rate = n_cycle_drafted > 0 ? (float)n_cycle_accepted / n_cycle_drafted : 0.0f;
+            const int64_t t_gpu = t_draft_total + t_verify_total;
+            float gpu_busy_pct = t_cycle_total > 0 ? (float)t_gpu / t_cycle_total * 100.0f : 0.0f;
+            int hw_gpu_busy = read_amd_gpu_busy_percent();
+            SRV_INF("spec cycle (%d slots): draft=%.1fms verify=%.1fms accept=%.1fms other=%.1fms total=%.1fms | gpu_est=%.1f%% hw=%d%% | accepted %d/%d (%.1f%%)\n",
                     n_slots_drafted,
                     t_draft_total / 1e3, t_verify_total / 1e3, t_accept_total / 1e3,
-                    t_other / 1e3, t_cycle_total / 1e3);
+                    t_other / 1e3, t_cycle_total / 1e3,
+                    gpu_busy_pct, hw_gpu_busy,
+                    n_cycle_accepted, n_cycle_drafted, 100.0f * cycle_accept_rate);
         }
 
         // turn off DFlash tape recording after all sub-batches — was turned on
