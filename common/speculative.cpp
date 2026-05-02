@@ -1254,9 +1254,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int n_low_streak = 0;
     bool disabled = false;
     int cooldown_tokens = 0;
-    static constexpr int LOW_STREAK_THRESHOLD = 2;
-    static constexpr float LOW_ACCEPT_THRESHOLD = 0.50f;
-    static constexpr int COOLDOWN_TOKEN_COUNT = 64;
+    static constexpr int LOW_STREAK_THRESHOLD = 4;
+    static constexpr float LOW_ACCEPT_THRESHOLD = 0.30f;
+    static constexpr int COOLDOWN_TOKEN_COUNT = 128;
     int n_draft_last = 0;
     float accept_rate_ema = 1.0f;
     static constexpr float EMA_ALPHA = 0.3f;
@@ -1370,9 +1370,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
     // called after initial prefill — extract hidden states from target
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        n_low_streak = 0;
+        disabled = false;
+        cooldown_tokens = 0;
+        accept_rate_ema = 1.0f;
         if (prefill_flushed) {
-            // ring was already populated incrementally by flush_prefill() calls
-            // during checkpoint-split prefill — nothing to do
             prefill_flushed = false;
             return;
         }
@@ -1589,14 +1591,14 @@ struct common_speculative_state_dflash : public common_speculative_state {
             accept_rate_ema = EMA_ALPHA * acceptance_rate + (1.0f - EMA_ALPHA) * accept_rate_ema;
             if (acceptance_rate < LOW_ACCEPT_THRESHOLD) {
                 n_low_streak++;
-                if (n_low_streak >= LOW_STREAK_THRESHOLD || accept_rate_ema < LOW_ACCEPT_THRESHOLD * 0.6f) {
-                    disabled = true;
-                    cooldown_tokens = 0;
-                    LOG_WRN("dflash adaptive: disabling due to low acceptance (streak=%d, rate=%.1f%%, ema=%.1f%%)\n",
-                            n_low_streak, 100.0f * acceptance_rate, 100.0f * accept_rate_ema);
-                }
             } else {
                 n_low_streak = 0;
+            }
+            if (n_low_streak >= LOW_STREAK_THRESHOLD && accept_rate_ema < LOW_ACCEPT_THRESHOLD) {
+                disabled = true;
+                cooldown_tokens = 0;
+                LOG_WRN("dflash adaptive: disabling due to low acceptance (streak=%d, rate=%.1f%%, ema=%.1f%%)\n",
+                        n_low_streak, 100.0f * acceptance_rate, 100.0f * accept_rate_ema);
             }
         }
     }
