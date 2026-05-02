@@ -1261,6 +1261,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
     float accept_rate_ema = 1.0f;
     static constexpr float EMA_ALPHA = 0.3f;
 
+    // acceptance rate tracker for periodic diagnosis
+    int accept_sample_count = 0;
+    float accept_rate_sum = 0.0f;
+
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
         if (gpu_ring_handle) {
@@ -1546,20 +1550,22 @@ struct common_speculative_state_dflash : public common_speculative_state {
         // read argmax tokens for positions 1..batch_len-1 (skip position 0 = staged_first)
         {
             int32_t * argmax = llama_get_logits_argmax(ctx_dft);
-            float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
-            const int K_flat = llama_get_logits_argmax_k(ctx_dft);
-            if (argmax) {
-                // GPU argmax path — only 64-128 bytes transferred instead of 15.9MB
-                for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
+        float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+        const int K_flat = llama_get_logits_argmax_k(ctx_dft);
+        if (argmax) {
+            // GPU argmax path — only 64-128 bytes transferred instead of 15.9MB
+            LOG_DBG("dflash sampler: GPU argmax path K=%d\n", K_flat);
+            for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
                     result.push_back((llama_token) argmax[i * K_flat]);
                     if (draft_log_probs && argmax_probs) {
                         draft_log_probs->push_back(argmax_probs[i * K_flat]);
                     }
                 }
             } else {
-                // fallback: CPU argmax over full vocab
-                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-                for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
+            // fallback: CPU argmax over full vocab
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+            LOG_DBG("dflash sampler: CPU fallback argmax n_vocab=%d\n", n_vocab);
+            for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
                     float * logits = llama_get_logits_ith(ctx_dft, i);
                     if (!logits) {
                         break;
@@ -1575,7 +1581,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         const int64_t t4 = ggml_time_us();
 
-        LOG_DBG("dflash draft breakdown (ctx=%d): concat=%.1fms cross=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
+        LOG_DBG("dflash draft breakdown (ctx=%d): cross_data=%.1fms set_input=%.1fms decode=%.1fms argmax=%.1fms total=%.1fms\n",
                 committed_len,
                 (t1 - t0) / 1e3, (t2 - t1) / 1e3, (t3 - t2) / 1e3, (t4 - t3) / 1e3, (t4 - t0) / 1e3);
 
@@ -1594,6 +1600,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
             } else {
                 n_low_streak = 0;
             }
+
+            // periodic acceptance rate diagnosis
+            accept_sample_count++;
+            accept_rate_sum += acceptance_rate;
+            if (accept_sample_count >= 50) {
+                float avg_rate = accept_rate_sum / (float)accept_sample_count;
+                LOG_INF("dflash accept stats (last %d cycles): avg_rate=%.1f%% ema=%.1f%% streak=%d%s\n",
+                        accept_sample_count, 100.0f * avg_rate, 100.0f * accept_rate_ema,
+                        n_low_streak, disabled ? " (DISABLED)" : "");
+                accept_sample_count = 0;
+                accept_rate_sum = 0.0f;
+            }
+
             if (n_low_streak >= LOW_STREAK_THRESHOLD && accept_rate_ema < LOW_ACCEPT_THRESHOLD) {
                 disabled = true;
                 cooldown_tokens = 0;

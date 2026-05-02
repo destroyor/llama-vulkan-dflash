@@ -16332,7 +16332,7 @@ extern "C" {
     void * dflash_cross_ring_vk_alloc(int n_layers, int n_embd, int ring_size, int device_idx);
     void dflash_cross_ring_vk_free(void * handle);
     void dflash_cross_ring_vk_write(void * handle, int layer, int ring_pos, const float * host_data, int n_tokens, int n_embd);
-    const float * dflash_cross_ring_vk_interleave(void * handle, int write_pos, int filled, int ctx_window);
+    void dflash_cross_ring_vk_interleave_submit(void * handle, int write_pos, int filled, int ctx_window);
     void dflash_cross_ring_vk_set_tensor(void * cross_ring_handle, const void * d_src, size_t offset, size_t size);
     void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cross_ring_handle, size_t src_offset, size_t size);
 }
@@ -16569,6 +16569,45 @@ extern "C" void dflash_cross_ring_vk_write(void * handle, int layer, int ring_po
     ring->vkdev.freeCommandBuffers(ring->command_pool, cmd);
 }
 
+extern "C" void dflash_cross_ring_vk_interleave_submit(void * handle, int write_pos, int filled, int ctx_window) {
+    if (!handle) return;
+
+    auto * ring = (dflash_cross_ring_vk *)handle;
+    if (filled <= 0) return;
+
+    int cross_len = std::min(filled, ctx_window > 0 ? ctx_window : filled);
+    int read_start = (write_pos - cross_len + ring->ring_size) % ring->ring_size;
+
+    VK_CHECK(ring->vkdev.waitForFences(ring->fence, true, UINT64_MAX), "dflash_cross_ring_vk_interleave_submit prev fence");
+    ring->vkdev.resetFences(ring->fence);
+
+    ring->cmd.reset(vk::CommandBufferResetFlagBits::eReleaseResources);
+
+    vk::CommandBufferBeginInfo begin_info(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+    ring->cmd.begin(begin_info);
+
+    const size_t layer_bytes = (size_t)ring->ring_size * ring->n_embd * sizeof(float);
+    const size_t token_bytes = (size_t)ring->n_embd * sizeof(float);
+    const size_t interleaved_token_bytes = (size_t)ring->n_layers * ring->n_embd * sizeof(float);
+
+    for (int t = 0; t < cross_len; ++t) {
+        int ring_slot = (read_start + t) % ring->ring_size;
+        size_t dst_offset = (size_t)t * interleaved_token_bytes;
+        for (int l = 0; l < ring->n_layers; ++l) {
+            size_t src_offset = (size_t)l * layer_bytes + (size_t)ring_slot * token_bytes;
+            size_t interleave_dst = dst_offset + (size_t)l * token_bytes;
+            vk::BufferCopy copy_region(src_offset, interleave_dst, token_bytes);
+            ring->cmd.copyBuffer(ring->ring_buffer, ring->staging_buffer, copy_region);
+        }
+    }
+
+    ring->cmd.end();
+
+    vk::SubmitInfo submit_info({}, {}, ring->cmd);
+    ring->queue.submit(submit_info, ring->fence);
+    // fence is NOT waited here — D2D path will wait later via d2d_fence in set_tensor_d2d
+}
+
 extern "C" const float * dflash_cross_ring_vk_interleave(void * handle, int write_pos, int filled, int ctx_window) {
     if (!handle) return nullptr;
     auto * ring = (dflash_cross_ring_vk *)handle;
@@ -16655,9 +16694,15 @@ extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cr
     auto * ring = (dflash_cross_ring_vk *)cross_ring_handle;
 
     if (dst->buffer && ggml_backend_buffer_is_vk(dst->buffer)) {
+        fprintf(stderr, "[DFlash-D2D] PATH=D2D_vkCmdCopyBuffer src_offset=%zu size=%zu\n",
+                src_offset, size);
+
         auto * buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
         vk_buffer dst_vkbuf = buf_ctx->dev_buffer;
         size_t dst_offset = vk_tensor_offset(dst) + dst->view_offs;
+
+        fprintf(stderr, "[DFlash-D2D] D2D copying staging[%zu] -> vk_buffer[%zu] size=%zu\n",
+                src_offset, dst_offset, size);
 
         VK_CHECK(ring->vkdev.waitForFences(ring->d2d_fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor_d2d prev fence");
         ring->vkdev.resetFences(ring->d2d_fence);
@@ -16685,6 +16730,9 @@ extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cr
         vk::SubmitInfo submit_info({}, {}, ring->d2d_cmd);
         ring->queue.submit(submit_info, ring->d2d_fence);
     } else if (dst->buffer && ggml_backend_buffer_is_host(dst->buffer)) {
+        fprintf(stderr, "[DFlash-D2D] PATH=CPU_fallback reason=host_buffer src_offset=%zu size=%zu\n",
+                src_offset, size);
+
         const uint8_t * src_ptr = (const uint8_t *)ring->host_staging_ptr + src_offset;
         {
             const float * fsrc = (const float *)src_ptr;
@@ -16703,6 +16751,12 @@ extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cr
                     (sum_src == sum_dst) ? "BIT_EXACT" : "MISMATCH");
         }
         ggml_backend_tensor_set(dst, src_ptr, 0, size);
+    } else {
+        const char * buf_name = dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "null_buffer";
+        bool is_vk_native = dst->buffer ? ggml_backend_buffer_is_vk(dst->buffer) : false;
+        bool is_vk_or_host = dst->buffer ? ggml_backend_buffer_is_vk_or_host(dst->buffer) : false;
+        fprintf(stderr, "[DFlash-D2D] PATH=NOOP_fallback reason=buffer_type_not_supported buf=%s is_vk=%d is_vk_or_host=%d size=%zu\n",
+                buf_name, is_vk_native, is_vk_or_host, size);
     }
 }
 
@@ -16722,6 +16776,9 @@ static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const cha
     }
     if (strcmp(name, "dflash_cross_ring_gpu_interleave") == 0) {
         return (void *)dflash_cross_ring_vk_interleave;
+    }
+    if (strcmp(name, "dflash_cross_ring_gpu_interleave_submit") == 0) {
+        return (void *)dflash_cross_ring_vk_interleave_submit;
     }
     if (strcmp(name, "dflash_cross_ring_gpu_set_tensor") == 0) {
         return (void *)dflash_cross_ring_vk_set_tensor;

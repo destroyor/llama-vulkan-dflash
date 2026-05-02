@@ -306,8 +306,14 @@ int main(int argc, char ** argv) {
     }
 
 
+    int64_t t_draft_prev   = 0;
+    int64_t t_decode1_prev = 0;
+    int64_t t_sample_prev  = 0;
+
     while (true) {
         n_iters++;
+
+        const int64_t t_cycle_start = ggml_time_us();
 
         llama_tokens ids;
         int n_draft_this_iter = 0;
@@ -633,6 +639,24 @@ int main(int argc, char ** argv) {
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), 0, n_past, -1);
             // Clear stale parent_ids if no rollback happened
             llama_clear_tree_parent_ids(ctx_tgt);
+        }
+
+        {
+            const int64_t t_cycle_end   = ggml_time_us();
+            const int64_t t_cycle       = t_cycle_end - t_cycle_start;
+            const int64_t t_draft_d     = t_draft_total   - t_draft_prev;
+            const int64_t t_decode1_d   = t_decode1_total - t_decode1_prev;
+            const int64_t t_sample_d    = t_sample_total  - t_sample_prev;
+            const int     n_accepted    = (int)ids.size() - 1;
+            const float   tok_per_s     = t_cycle > 0 ? (n_accepted + 1) * 1e6f / (float)t_cycle : 0.0f;
+
+            t_draft_prev   = t_draft_total;
+            t_decode1_prev = t_decode1_total;
+            t_sample_prev  = t_sample_total;
+
+            LOG_INF("[cycle %d] total=%.2fms draft=%.2fms verify=%.2fms sample=%.2fms accept=%d/%d throughput=%.1f tok/s\n",
+                    n_iters, t_cycle / 1e3, t_draft_d / 1e3, t_decode1_d / 1e3, t_sample_d / 1e3,
+                    n_accepted, n_draft_this_iter, tok_per_s);
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
