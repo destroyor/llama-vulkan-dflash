@@ -16709,12 +16709,8 @@ extern "C" const float * dflash_cross_ring_vk_interleave(void * handle, int writ
 
         cmd.dispatch(cross_len, ring->n_layers, 1);
 
-        vk::MemoryBarrier mem_barrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eShaderRead);
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader, {}, mem_barrier, {}, {});
-
-        size_t host_copy_size = (size_t)cross_len * ring->n_layers * ring->n_embd * sizeof(float);
-        vk::BufferCopy host_region(0, 0, host_copy_size);
-        cmd.copyBuffer(ring->staging_buffer, ring->host_staging_buffer, host_region);
+        vk::MemoryBarrier mem_barrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead);
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader, {}, mem_barrier, {}, {});
 
         cmd.end();
 
@@ -16850,8 +16846,6 @@ extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cr
         ring->vkdev.resetFences(ring->d2d_fences[ring->d2d_frame_idx]);
         ring->queue.submit(submit_info, ring->d2d_fences[ring->d2d_frame_idx]);
         ring->d2d_frame_idx ^= 1;
-
-        VK_CHECK(ring->vkdev.waitForFences(ring->d2d_fences[ring->d2d_frame_idx ^ 1], true, UINT64_MAX), "set_tensor_d2d completion");
     } else if (dst->buffer && ggml_backend_buffer_is_host(dst->buffer)) {
         const uint8_t * src_ptr = (const uint8_t *)ring->host_staging_ptr + src_offset;
 #ifdef GGML_VK_VERIFY
