@@ -1254,9 +1254,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int n_low_streak = 0;
     bool disabled = false;
     int cooldown_tokens = 0;
-    static constexpr int LOW_STREAK_THRESHOLD = 3;
+    static constexpr int LOW_STREAK_THRESHOLD = 2;
     static constexpr float LOW_ACCEPT_THRESHOLD = 0.30f;
-    static constexpr float DISABLE_ACCEPT_THRESHOLD = 0.35f;
+    static constexpr float DISABLE_ACCEPT_THRESHOLD = 0.50f;
     static constexpr int COOLDOWN_TOKEN_COUNT = 256;
     int n_draft_last = 0;
     float accept_rate_ema = 0.5f;
