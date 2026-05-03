@@ -1260,6 +1260,26 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int n_draft_last = 0;
     float accept_rate_ema = 1.0f;
     static constexpr float EMA_ALPHA = 0.3f;
+    int adaptive_n_max = 0;
+
+    int get_adaptive_n_max(int n_max) {
+        if (adaptive_n_max == 0) {
+            adaptive_n_max = std::min(n_max, 8);
+        }
+        return adaptive_n_max;
+    }
+
+    void update_adaptive_n_max() {
+        if (accept_rate_ema > 0.80f) {
+            adaptive_n_max = std::min(adaptive_n_max + 1, 15);
+        } else if (accept_rate_ema > 0.60f) {
+            adaptive_n_max = std::clamp(adaptive_n_max, 8, 10);
+        } else if (accept_rate_ema > 0.40f) {
+            adaptive_n_max = std::clamp(adaptive_n_max, 5, 8);
+        } else if (accept_rate_ema > 0.25f) {
+            adaptive_n_max = std::min(adaptive_n_max, 5);
+        }
+    }
 
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
@@ -1352,6 +1372,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 cooldown_tokens = 0;
                 n_low_streak = 0;
                 accept_rate_ema = 1.0f;
+                adaptive_n_max = 0;
                 LOG_INF("dflash adaptive: re-enabling after cooldown (%d tokens)\n", COOLDOWN_TOKEN_COUNT);
             }
         }
@@ -1374,6 +1395,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         disabled = false;
         cooldown_tokens = 0;
         accept_rate_ema = 1.0f;
+        adaptive_n_max = 0;
         if (prefill_flushed) {
             prefill_flushed = false;
             return;
@@ -1511,7 +1533,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        const int n_draft = std::min(block_size - 1, params.n_max);
+        const int n_draft = std::min(block_size - 1, get_adaptive_n_max(params.n_max));
         if (committed_len == 0) {
             return;
         }
@@ -1589,6 +1611,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (n_draft_last > 0) {
             float acceptance_rate = (float)n_accepted / (float)n_draft_last;
             accept_rate_ema = EMA_ALPHA * acceptance_rate + (1.0f - EMA_ALPHA) * accept_rate_ema;
+            update_adaptive_n_max();
             if (acceptance_rate < LOW_ACCEPT_THRESHOLD) {
                 n_low_streak++;
             } else {
@@ -1623,7 +1646,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        const int n_draft = std::min((int) params.n_max, block_size - 1);
+        const int n_draft = std::min(get_adaptive_n_max(params.n_max), block_size - 1);
         if (n_draft <= 0 || committed_len == 0) {
             return;
         }
