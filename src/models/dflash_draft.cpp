@@ -375,6 +375,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     // --- Fusion layer: project concatenated target hidden states ---
     ggml_tensor * fused_target = build_lora_mm(model.dflash_fc, target_hidden);
+    ggml_mul_mat_set_prec(fused_target, GGML_PREC_F32);
     fused_target = build_norm(fused_target, model.dflash_hidden_norm, nullptr, LLM_NORM_RMS, -1);
     cb(fused_target, "fused_target", -1);
 
@@ -391,6 +392,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         {
             // Q from drafter hidden only
             ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
+            ggml_mul_mat_set_prec(Qcur, GGML_PREC_F32);
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
             Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
@@ -400,6 +402,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
             // K from drafter (noise tokens)
             ggml_tensor * Kcur_noise = build_lora_mm(model.layers[il].wk, cur);
+            ggml_mul_mat_set_prec(Kcur_noise, GGML_PREC_F32);
             Kcur_noise = ggml_reshape_3d(ctx0, Kcur_noise, n_embd_head, n_head_kv, n_tokens);
             Kcur_noise = build_norm(Kcur_noise, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
             Kcur_noise = ggml_rope_ext(ctx0, Kcur_noise, inp_pos, nullptr,
@@ -409,6 +412,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
             // K from target (context features)
             ggml_tensor * Kcur_ctx = build_lora_mm(model.layers[il].wk, fused_target);
+            ggml_mul_mat_set_prec(Kcur_ctx, GGML_PREC_F32);
             Kcur_ctx = ggml_reshape_3d(ctx0, Kcur_ctx, n_embd_head, n_head_kv, ctx_len);
             Kcur_ctx = build_norm(Kcur_ctx, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
             Kcur_ctx = ggml_rope_ext(ctx0, Kcur_ctx, pos_ctx, nullptr,
@@ -418,11 +422,13 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
             // V from drafter (noise tokens)
             ggml_tensor * Vcur_noise = build_lora_mm(model.layers[il].wv, cur);
+            ggml_mul_mat_set_prec(Vcur_noise, GGML_PREC_F32);
             Vcur_noise = ggml_reshape_3d(ctx0, Vcur_noise, n_embd_head, n_head_kv, n_tokens);
             cb(Vcur_noise, "Vcur_noise", il);
 
             // V from target (context features)
             ggml_tensor * Vcur_ctx = build_lora_mm(model.layers[il].wv, fused_target);
+            ggml_mul_mat_set_prec(Vcur_ctx, GGML_PREC_F32);
             Vcur_ctx = ggml_reshape_3d(ctx0, Vcur_ctx, n_embd_head, n_head_kv, ctx_len);
             cb(Vcur_ctx, "Vcur_ctx", il);
 
@@ -448,6 +454,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
             // output projection
             cur = build_lora_mm(model.layers[il].wo, cur);
+            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
 
         // residual connection
@@ -487,6 +494,7 @@ llm_build_dflash_draft::llm_build_dflash_draft(
         output_use = ggml_new_tensor_2d(ctx0, GGML_TYPE_Q4_0, n_embd, model.vocab.n_tokens());
     }
     cur = build_lora_mm(output_use, cur);
+    ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

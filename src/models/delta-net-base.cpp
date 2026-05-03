@@ -118,7 +118,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
         // decay_k_b_i [S,BT,BT,CHB] @ k_j [S,1,BT,CHB] = Akk [BT,1,BT,CHB]
         kb = ggml_mul_mat(ctx0, decay_k_b_i, k_j);
+        ggml_mul_mat_set_prec(kb, GGML_PREC_F32);
         kq = ggml_mul_mat(ctx0, decay_q_i,   k_j);
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
 
         kb = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_4d(ctx0, kb, CS, CS, n_chunks, H_v * n_seqs)));
         kq = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_reshape_4d(ctx0, kq, CS, CS, n_chunks, H_v * n_seqs)));
@@ -137,10 +139,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
         // [CS, CS, n_chunks, H_k * n_seqs]
         kb = ggml_mul_mat(ctx0, k,  k_b);
+        ggml_mul_mat_set_prec(kb, GGML_PREC_F32);
         kb = ggml_mul    (ctx0, kb, decay_mask);
 
         // [CS, CS, n_chunks, H_k * n_seqs]
         kq = ggml_mul_mat(ctx0, k, q);
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
         kq = ggml_mul(ctx0, kq, decay_mask);
     }
 
@@ -169,6 +173,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // [S_v, CS, n_chunks, H_v * n_seqs]
     v = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, v_b)), attn);
+    ggml_mul_mat_set_prec(v, GGML_PREC_F32);
 
     // [CS, 1, n_chunks, H_v * n_seqs] KDA: [CS, S_k, n_chunks, H_v * n_seqs]
     ggml_tensor * g_exp = ggml_exp(ctx0, g_cs);
@@ -181,6 +186,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // [S_k, CS, n_chunks, H_k * n_seqs]
     ggml_tensor * k_cd = ggml_mul_mat(ctx0, kbg, attn);
+    ggml_mul_mat_set_prec(k_cd, GGML_PREC_F32);
     cb(k_cd, "k_cumdecay", il);
 
     // [1, CS, n_chunks, H_k * n_seqs] KDA: [S_k, CS, n_chunks, H_k * n_seqs]
@@ -241,6 +247,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
         // [CS, S_v, 1, H_v * n_seqs]
         ggml_tensor * v_t_p = ggml_mul_mat(ctx0, ch_k_cd, s);
+        ggml_mul_mat_set_prec(v_t_p, GGML_PREC_F32);
         cb(v_t_p, "v_prime", il);
 
         // [CS, S_v, 1, H_v * n_seqs]
@@ -249,10 +256,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
         // [S_v, CS, 1, H_v * n_seqs]
         ggml_tensor * v_attn = ggml_mul_mat(ctx0, v_t_new, ch_kq);
+        ggml_mul_mat_set_prec(v_attn, GGML_PREC_F32);
         cb(v_attn, "v_attn", il);
 
         // [S_v, CS, 1, H_v * n_seqs]
         ggml_tensor * attn_inter = ggml_mul_mat(ctx0, s, ch_q_g_exp);
+        ggml_mul_mat_set_prec(attn_inter, GGML_PREC_F32);
         cb(attn_inter, "attn_inter", il);
 
         // [S_v, CS, 1, H_v * n_seqs]
@@ -264,6 +273,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         // kgdmulvnew = (key_gdiff).transpose(-1, -2) @ v_new
         // TODO: head broadcast might not work here - probably will need a transpose
         ggml_tensor * kgv = ggml_mul_mat(ctx0, ch_kg_t, v_t_new); // [S_k, S_v, 1, H_k * n_seqs]
+        ggml_mul_mat_set_prec(kgv, GGML_PREC_F32);
 
         // last_recurrent_state = last_recurrent_state * g_last + kgdmulvnew
         ggml_tensor * ch_g_last_exp_t = get_slice_2d(ctx0, g_last_exp_t, chunk);

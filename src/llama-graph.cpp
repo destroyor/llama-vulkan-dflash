@@ -1105,6 +1105,9 @@ ggml_tensor * llm_graph_context::build_ffn(
    llm_ffn_gate_type   type_gate,
                  int   il) const {
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    if (up && arch == LLM_ARCH_DFLASH_DRAFT) {
+        ggml_mul_mat_set_prec(tmp, GGML_PREC_F32);
+    }
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1122,11 +1125,17 @@ ggml_tensor * llm_graph_context::build_ffn(
             case LLM_FFN_SEQ:
                 {
                     cur = build_lora_mm(gate, tmp);
+                    if (arch == LLM_ARCH_DFLASH_DRAFT) {
+                        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                    }
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
                     cur = build_lora_mm(gate, cur);
+                    if (arch == LLM_ARCH_DFLASH_DRAFT) {
+                        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                    }
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -1231,7 +1240,7 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     if (down) {
         cur = build_lora_mm(down, cur);
-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2 || arch == LLM_ARCH_DFLASH_DRAFT) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
