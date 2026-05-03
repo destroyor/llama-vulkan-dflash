@@ -104,9 +104,7 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
                     target_hidden ? target_hidden->data : nullptr,
                     n_copy, n_feat, actual_bytes);
             if (src_gpu_vk && cross->fn_set_tensor_d2d_vk) {
-                // Vulkan D2D path: pass ggml_tensor* + cross ring handle
-                size_t src_offset = (size_t)win_off * n_feat * sizeof(float);
-                cross->fn_set_tensor_d2d_vk(target_hidden, src_gpu_vk, src_offset, actual_bytes);
+                cross->fn_set_tensor_d2d_vk(target_hidden, src_gpu_vk, 0, actual_bytes);
             } else if (src_gpu && cross->fn_set_tensor_d2d) {
                 // CUDA/HIP D2D path
                 const void * gpu_src = (const char *)src_gpu + (size_t)win_off * n_feat * sizeof(float);
@@ -183,13 +181,13 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         const size_t n_feat       = cross ? (size_t) cross->n_embd : 0;
 
         // collect per-slot cross data
-        struct { const float * data; int64_t n_real; } slot_info[LLAMA_DFLASH_MAX_SLOTS] = {};
+        struct { const float * data; int64_t n_real; void * gpu_vk; } slot_info[LLAMA_DFLASH_MAX_SLOTS] = {};
         for (int s = 0; s < n_seqs && s < LLAMA_DFLASH_MAX_SLOTS; s++) {
             llama_seq_id seq = ubatch->seq_id_unq[s];
             if (!cross) { continue; }
             auto it = cross->v_embd_per_seq.find(seq);
             if (it != cross->v_embd_per_seq.end() && !it->second.v_embd.empty()) {
-                slot_info[s] = { it->second.v_embd.data(), it->second.n_enc_real };
+                slot_info[s] = { it->second.v_embd.data(), it->second.n_enc_real, it->second.v_embd_gpu_vk };
             }
         }
 
@@ -206,11 +204,15 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
         if (target_hidden && n_feat > 0) {
             ggml_backend_tensor_memset(target_hidden, 0, 0, ggml_nbytes(target_hidden));
             for (int s = 0; s < n_seqs; s++) {
-                if (!slot_info[s].data || slot_n_copy[s] <= 0) { continue; }
-                const float * src = slot_info[s].data + slot_win_off[s] * n_feat;
+                if (slot_n_copy[s] <= 0) { continue; }
                 const size_t copy_bytes = n_feat * (size_t) slot_n_copy[s] * sizeof(float);
                 const size_t dst_offset = (size_t) s * (size_t) per_slot_ctx * n_feat * sizeof(float);
-                ggml_backend_tensor_set(target_hidden, src, dst_offset, copy_bytes);
+                if (slot_info[s].gpu_vk && cross->fn_set_tensor_d2d_vk) {
+                    cross->fn_set_tensor_d2d_vk(target_hidden, slot_info[s].gpu_vk, 0, copy_bytes);
+                } else if (slot_info[s].data) {
+                    const float * src = slot_info[s].data + slot_win_off[s] * n_feat;
+                    ggml_backend_tensor_set(target_hidden, src, dst_offset, copy_bytes);
+                }
             }
         }
 
@@ -329,7 +331,6 @@ llm_build_dflash_draft::llm_build_dflash_draft(
 
     // concatenated target hidden states [n_target_features, ctx_len]
     inp_dflash->target_hidden = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_target_features, ctx_len);
-    ggml_set_input(inp_dflash->target_hidden);
     cb(inp_dflash->target_hidden, "dflash_target_hidden", -1);
 
     // context positions for K RoPE [ctx_len]

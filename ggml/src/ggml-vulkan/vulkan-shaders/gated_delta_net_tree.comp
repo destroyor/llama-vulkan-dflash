@@ -145,7 +145,7 @@ void main() {
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0u) {
-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+            const FLOAT_TYPE g_val = exp2(FLOAT_TYPE(data_g[gb_off]) * 1.442695041f);
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 g_exp[r] = g_val;
             }
@@ -153,17 +153,25 @@ void main() {
             const uint g_base = gb_off * S_V;
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 const uint i = r * LANES_PER_COLUMN + lane;
-                g_exp[r] = exp(FLOAT_TYPE(data_g[g_base + i]));
+                g_exp[r] = exp2(FLOAT_TYPE(data_g[g_base + i]) * 1.442695041f);
             }
         }
 
         const FLOAT_TYPE v_val = FLOAT_TYPE(data_v[v_off + col]);
 
         FLOAT_TYPE kv_shard = 0.0;
-        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
+        FLOAT_TYPE kv_col;
+        if (KDA == 0u) {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                kv_shard += s_shard[r] * k_reg[r];
+            }
+            kv_col = g_exp[0] * reduce_partial(kv_shard);
+        } else {
+            [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+                kv_shard += g_exp[r] * s_shard[r] * k_reg[r];
+            }
+            kv_col = reduce_partial(kv_shard);
         }
-        FLOAT_TYPE kv_col = reduce_partial(kv_shard);
 
         FLOAT_TYPE delta_col = (v_val - kv_col) * beta_val;
 

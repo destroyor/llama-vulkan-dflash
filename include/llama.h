@@ -1156,7 +1156,11 @@ extern "C" {
     LLAMA_API void * llama_dflash_cross_ring_gpu_init(struct llama_context * ctx, int n_layers, int n_embd, int ring_size);
     LLAMA_API void   llama_dflash_cross_ring_gpu_free(void * handle);
     LLAMA_API void   llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, const float * data, int n_tokens, int n_embd);
+    LLAMA_API void   llama_dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, struct ggml_tensor * src_tensor, int src_offset_tokens, int n_tokens, int n_embd);
     LLAMA_API void   llama_dflash_cross_ring_gpu_set_cross(struct llama_context * ctx, void * handle, llama_seq_id seq_id, int ring_write_pos, int ring_filled, int n_layers, int n_embd, int ctx_window);
+
+    // DFlash: get the GPU tensor pointer for a captured hidden state layer (for D2D ring write)
+    LLAMA_API struct ggml_tensor * llama_get_layer_hidden_tensor(struct llama_context * ctx, int slot);
 
     // DDTree: set tree attention mask for verification decode
     // visibility: bool[n_tree_tokens * n_tree_tokens] row-major, true = can attend

@@ -39,6 +39,7 @@ struct llama_memory_breakdown_data {
 // DFlash: hidden state buffer for captured layer activations
 struct dflash_layer_hidden_buf {
     std::vector<float> data;
+    struct ggml_tensor * src_tensor = nullptr;
     int64_t n_embd = 0;
     int64_t n_tokens = 0;
 };
@@ -378,6 +379,7 @@ public:
 
     // DFlash hidden state accessors
     float * get_layer_hidden(int layer_idx);
+    struct ggml_tensor * get_layer_hidden_tensor(int layer_idx);
     int64_t get_layer_hidden_n_tokens(int layer_idx) const;
     int64_t get_layer_hidden_n_embd(int layer_idx) const;
     int32_t get_n_layer_hiddens() const;

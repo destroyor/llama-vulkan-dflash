@@ -920,6 +920,14 @@ float * llama_context::get_layer_hidden(int layer_idx) {
     return (*sh)[layer_idx].data.data();
 }
 
+struct ggml_tensor * llama_context::get_layer_hidden_tensor(int layer_idx) {
+    auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
+    if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
+        return nullptr;
+    }
+    return (*sh)[layer_idx].src_tensor;
+}
+
 int64_t llama_context::get_layer_hidden_n_tokens(int layer_idx) const {
     auto * sh = dflash_capture ? dflash_capture->active_slot_hiddens() : nullptr;
     if (!sh || layer_idx < 0 || layer_idx >= (int) sh->size()) {
@@ -1055,6 +1063,7 @@ static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_d
             GGML_ASSERT(h_idx < sh->size());
             auto & buf = (*sh)[h_idx];
             buf.n_embd = new_embd;
+            buf.src_tensor = t;
             const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
             const size_t add_elems = (size_t) new_n * (size_t) new_embd;
             buf.data.resize(old_elems + add_elems);
@@ -4629,6 +4638,10 @@ float * llama_get_layer_hidden(llama_context * ctx, int slot) {
     return ctx->get_layer_hidden(slot);
 }
 
+struct ggml_tensor * llama_get_layer_hidden_tensor(llama_context * ctx, int slot) {
+    return ctx->get_layer_hidden_tensor(slot);
+}
+
 int64_t llama_get_layer_hidden_n_tokens(llama_context * ctx, int slot) {
     return ctx->get_layer_hidden_n_tokens(slot);
 }
@@ -4706,8 +4719,8 @@ struct dflash_cross_ring_handle {
     void * gpu_ring;
     void   (*fn_free)(void *);
     void   (*fn_write)(void *, int, int, const float *, int, int);
+    void   (*fn_write_d2d)(void *, int, int, struct ggml_tensor *, int, int, int);
     const float * (*fn_interleave)(void *, int, int, int);
-    void   (*fn_interleave_submit)(void *, int, int, int);
     void   (*fn_set_tensor)(void *, const void *, size_t, size_t);
     void   (*fn_set_tensor_d2d)(struct ggml_tensor *, void *, size_t, size_t);
 };
@@ -4729,8 +4742,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     using find_dev_fn_t   = int (*)(const char *);
     using free_fn_t       = void   (*)(void *);
     using write_fn_t      = void   (*)(void *, int, int, const float *, int, int);
+    using write_d2d_fn_t  = void   (*)(void *, int, int, struct ggml_tensor *, int, int, int);
     using interleave_fn_t = const float * (*)(void *, int, int, int);
-    using interleave_submit_fn_t = void (*)(void *, int, int, int);
     using set_tensor_fn_t = void   (*)(void *, const void *, size_t, size_t);
     using set_tensor_d2d_fn_t = void (*)(struct ggml_tensor *, void *, size_t, size_t);
 
@@ -4738,8 +4751,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     auto fn_alloc         = (alloc_fn_t)           ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_alloc");
     auto fn_free          = (free_fn_t)            ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_free");
     auto fn_write         = (write_fn_t)           ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_write");
+    auto fn_write_d2d     = (write_d2d_fn_t)       ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_write_d2d");
     auto fn_interleave    = (interleave_fn_t)      ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_interleave");
-    auto fn_interleave_submit = (interleave_submit_fn_t) ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_interleave_submit");
     auto fn_set_tensor    = (set_tensor_fn_t)      ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor");
     auto fn_set_tensor_d2d = (set_tensor_d2d_fn_t) ggml_backend_reg_get_proc_address(gpu_reg, "dflash_cross_ring_gpu_set_tensor_d2d");
 
@@ -4759,8 +4772,8 @@ void * llama_context::init_cross_ring_gpu(int n_layers, int n_embd, int ring_siz
     handle->gpu_ring          = gpu_ring;
     handle->fn_free           = fn_free;
     handle->fn_write          = fn_write;
+    handle->fn_write_d2d      = fn_write_d2d;
     handle->fn_interleave     = fn_interleave;
-    handle->fn_interleave_submit = fn_interleave_submit;
     handle->fn_set_tensor     = fn_set_tensor;
     handle->fn_set_tensor_d2d = fn_set_tensor_d2d;
     return handle;
@@ -4783,6 +4796,13 @@ void llama_dflash_cross_ring_gpu_write(void * handle, int layer, int ring_pos, c
     h->fn_write(h->gpu_ring, layer, ring_pos, data, n_tokens, n_embd);
 }
 
+void llama_dflash_cross_ring_gpu_write_d2d(void * handle, int layer, int ring_pos, struct ggml_tensor * src_tensor, int src_offset_tokens, int n_tokens, int n_embd) {
+    if (!handle) return;
+    auto * h = (dflash_cross_ring_handle *)handle;
+    if (!h->fn_write_d2d) return;
+    h->fn_write_d2d(h->gpu_ring, layer, ring_pos, src_tensor, src_offset_tokens, n_tokens, n_embd);
+}
+
 void llama_dflash_cross_ring_gpu_set_cross(
         llama_context * ctx, void * handle, llama_seq_id seq_id,
         int ring_write_pos, int ring_filled,
@@ -4794,21 +4814,14 @@ void llama_dflash_cross_ring_gpu_set_cross(
     int64_t n_target_features = (int64_t)n_layers * n_embd;
 
     if (h->fn_set_tensor_d2d) {
-        fprintf(stderr, "[DFlash-Cross] D2D path: fn_set_tensor_d2d AVAILABLE, calling set_cross_data_gpu_d2d seq=%d cross_len=%d n_layers=%d n_embd=%d\n",
-                (int)seq_id, cross_len, n_layers, n_embd);
-
-        // interleave_submit: ring→staging copy on GPU only, no CPU wait
-        // saves ~0.1-0.5ms per cycle vs fn_interleave (which does CPU roundtrip)
-        h->fn_interleave_submit(h->gpu_ring, ring_write_pos, ring_filled, ctx_window);
+        const float * d_staging = h->fn_interleave(h->gpu_ring, ring_write_pos, ring_filled, ctx_window);
+        if (!d_staging) return;
 
         using set_tensor_d2d_vk_fn_t = void (*)(struct ggml_tensor *, void *, size_t, size_t);
         ctx->set_cross_data_gpu_d2d(seq_id, h->gpu_ring, cross_len,
                                     n_layers, n_embd,
                                     (set_tensor_d2d_vk_fn_t)h->fn_set_tensor_d2d);
-    } else {
-        fprintf(stderr, "[DFlash-Cross] CPU_FALLBACK path: fn_set_tensor_d2d NOT_AVAILABLE, using llama_set_cross_data_seq seq=%d cross_len=%d n_layers=%d n_embd=%d\n",
-                (int)seq_id, cross_len, n_layers, n_embd);
-
+    } else if (h->fn_set_tensor) {
         const float * d_staging = h->fn_interleave(h->gpu_ring, ring_write_pos, ring_filled, ctx_window);
         if (!d_staging) return;
 
