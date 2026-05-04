@@ -2116,26 +2116,7 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         ctx->almost_ready_fence_pending = false;
     }
 
-    // Spin (w/pause) waiting for the graph to finish executing.
-    vk::Result result;
-    while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
-        if (result != vk::Result::eNotReady) {
-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
-            exit(1);
-        }
-        for (uint32_t i = 0; i < 100; ++i) {
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-        }
-    }
+    VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "fence wait");
     ctx->device->device.resetFences({ ctx->fence });
 }
 
@@ -16719,10 +16700,10 @@ extern "C" const float * dflash_cross_ring_vk_interleave(void * handle, int writ
         ring->queue.submit(submit_info, ring->d2d_fences[ring->d2d_frame_idx]);
         ring->d2d_frame_idx ^= 1;
 
+        VK_CHECK(ring->vkdev.waitForFences(ring->d2d_fences[ring->d2d_frame_idx ^ 1], true, UINT64_MAX), "dflash_cross_ring_vk_interleave fence wait");
+
         ring->last_interleave_cross_len = cross_len;
         ring->last_interleave_src_offset = 0;
-
-        VK_CHECK(ring->vkdev.waitForFences(ring->d2d_fences[ring->d2d_frame_idx ^ 1], true, UINT64_MAX), "dflash_cross_ring_vk_interleave fence wait");
 
         return (const float *)handle;
     } else {
@@ -16777,27 +16758,23 @@ extern "C" void dflash_cross_ring_vk_set_tensor(void * cross_ring_handle, const 
     vk_device dev = ring->device;
     if (!dev) return;
 
-    vk::FenceCreateInfo fence_info;
-    vk::Fence fence = ring->vkdev.createFence(fence_info);
+    VK_CHECK(ring->vkdev.waitForFences(ring->fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor waitForFences");
+    ring->vkdev.resetFences(ring->fence);
 
-    vk::CommandBufferAllocateInfo cmd_buf_info(ring->command_pool, vk::CommandBufferLevel::ePrimary, 1);
-    vk::CommandBuffer cmd = ring->vkdev.allocateCommandBuffers(cmd_buf_info)[0];
+    ring->d2d_cmd.reset(vk::CommandBufferResetFlagBits::eReleaseResources);
 
     vk::CommandBufferBeginInfo begin_info(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-    cmd.begin(begin_info);
+    ring->d2d_cmd.begin(begin_info);
 
     vk::BufferCopy copy_region(0, offset, size);
     vk::Buffer src_buf = vk::Buffer(reinterpret_cast<VkBuffer>(reinterpret_cast<uintptr_t>(d_src)));
-    cmd.copyBuffer(src_buf, ring->ring_buffer, copy_region);
+    ring->d2d_cmd.copyBuffer(src_buf, ring->ring_buffer, copy_region);
 
-    cmd.end();
+    ring->d2d_cmd.end();
 
-    vk::SubmitInfo submit_info({}, {}, cmd);
-    ring->queue.submit(submit_info, fence);
-    VK_CHECK(ring->vkdev.waitForFences(fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor waitForFences");
-
-    ring->vkdev.freeCommandBuffers(ring->command_pool, cmd);
-    ring->vkdev.destroyFence(fence);
+    vk::SubmitInfo submit_info({}, {}, ring->d2d_cmd);
+    ring->queue.submit(submit_info, ring->fence);
+    VK_CHECK(ring->vkdev.waitForFences(ring->fence, true, UINT64_MAX), "dflash_cross_ring_vk_set_tensor fence wait");
 }
 
 extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cross_ring_handle, size_t src_offset, size_t size) {
@@ -16805,14 +16782,6 @@ extern "C" void dflash_cross_ring_vk_set_tensor_d2d(ggml_tensor * dst, void * cr
 
     auto * ring = (dflash_cross_ring_vk *)cross_ring_handle;
     std::lock_guard<std::mutex> lock(ring->d2d_mutex);
-
-    {
-        const char * dst_buf_name = dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "null";
-        bool is_vk = dst->buffer ? ggml_backend_buffer_is_vk_or_host(dst->buffer) : false;
-        bool is_host = dst->buffer ? ggml_backend_buffer_is_host(dst->buffer) : false;
-        fprintf(stderr, "[DFlash-D2D] dst=%s buf=%s is_vk=%d is_host=%d size=%zu\n",
-                dst->name ? dst->name : "?", dst_buf_name, is_vk, is_host, size);
-    }
 
     if (dst->buffer && ggml_backend_buffer_is_vk(dst->buffer)) {
         auto * buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
