@@ -1256,7 +1256,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int cooldown_tokens = 0;
     static constexpr int LOW_STREAK_THRESHOLD = 2;
     static constexpr float LOW_ACCEPT_THRESHOLD = 0.30f;
-    static constexpr float DISABLE_ACCEPT_THRESHOLD = 0.50f;
+    static constexpr float DISABLE_ACCEPT_THRESHOLD = 0.40f;
     static constexpr int COOLDOWN_TOKEN_COUNT = 256;
     int n_draft_last = 0;
     float accept_rate_ema = 0.5f;
@@ -1282,13 +1282,13 @@ struct common_speculative_state_dflash : public common_speculative_state {
             }
         } else if (accept_rate_ema > 0.60f) {
             n_high_streak = 0;
-            adaptive_n_max = std::clamp(adaptive_n_max, 8, 10);
+            adaptive_n_max = std::clamp(adaptive_n_max, 5, 8);
         } else if (accept_rate_ema > 0.40f) {
             n_high_streak = 0;
-            adaptive_n_max = std::clamp(adaptive_n_max, 5, 8);
+            adaptive_n_max = std::clamp(adaptive_n_max, 3, 5);
         } else if (accept_rate_ema > DISABLE_ACCEPT_THRESHOLD) {
             n_high_streak = 0;
-            adaptive_n_max = std::min(adaptive_n_max, 5);
+            adaptive_n_max = std::min(adaptive_n_max, 3);
         }
     }
 
