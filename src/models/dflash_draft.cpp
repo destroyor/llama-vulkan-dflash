@@ -99,10 +99,6 @@ void llm_graph_input_dflash::set_input(const llama_ubatch * ubatch) {
             const size_t tensor_bytes = ggml_nbytes(target_hidden);
             const size_t actual_bytes = std::min(copy_bytes, tensor_bytes);
 
-            fprintf(stderr, "[DFlash-SetInput] target_hidden buf=%s data=%p n_copy=%d n_feat=%d bytes=%zu\n",
-                    target_hidden && target_hidden->buffer ? ggml_backend_buffer_name(target_hidden->buffer) : "null",
-                    target_hidden ? target_hidden->data : nullptr,
-                    n_copy, n_feat, actual_bytes);
             if (src_gpu_vk && cross->fn_set_tensor_d2d_vk) {
                 cross->fn_set_tensor_d2d_vk(target_hidden, src_gpu_vk, 0, actual_bytes);
             } else if (src_gpu && cross->fn_set_tensor_d2d) {

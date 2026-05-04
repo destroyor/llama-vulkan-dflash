@@ -16690,8 +16690,8 @@ extern "C" const float * dflash_cross_ring_vk_interleave(void * handle, int writ
 
         cmd.dispatch(cross_len, ring->n_layers, 1);
 
-        vk::MemoryBarrier mem_barrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead);
-        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader, {}, mem_barrier, {}, {});
+        vk::BufferMemoryBarrier buf_barrier(vk::AccessFlagBits::eShaderWrite, vk::AccessFlagBits::eShaderRead, 0, 0, ring->staging_buffer, 0, ring->staging_buffer_size);
+        cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eComputeShader, {}, {}, buf_barrier, {});
 
         cmd.end();
 

@@ -79,6 +79,7 @@ struct llama_cross {
     // Vulkan D2D path: cross ring handle + D2D function that accepts ggml_tensor*
     void * v_embd_gpu_vk = nullptr;
     void (*fn_set_tensor_d2d_vk)(struct ggml_tensor *, void *, size_t, size_t) = nullptr;
+    struct ggml_tensor * target_hidden_tensor = nullptr;
 
     // Per-seq cross buffers for DFlash multi-slot.
     // When non-empty, graph builders should pack these into target_hidden per slot
@@ -90,6 +91,7 @@ struct llama_cross {
         const void * v_embd_gpu = nullptr;
         int64_t v_embd_gpu_n_enc_real = 0;
         void * v_embd_gpu_vk = nullptr;
+        struct ggml_tensor * target_hidden_tensor = nullptr;
     };
     std::map<llama_seq_id, seq_cross> v_embd_per_seq;
 
