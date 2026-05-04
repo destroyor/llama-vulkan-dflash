@@ -90,9 +90,9 @@ set(GGML_BACKEND_DIR "" CACHE PATH "ggml: directory to load dynamic backends fro
 # TODO: mark all options as advanced when not GGML_STANDALONE
 
 if (APPLE)
-    set(GGML_METAL_DEFAULT ON)
-    set(GGML_BLAS_DEFAULT ON)
-    set(GGML_BLAS_VENDOR_DEFAULT "Apple")
+    set(GGML_METAL_DEFAULT OFF)
+    set(GGML_BLAS_DEFAULT OFF)
+    set(GGML_BLAS_VENDOR_DEFAULT "Generic")
 else()
     set(GGML_METAL_DEFAULT OFF)
     set(GGML_BLAS_DEFAULT OFF)
@@ -187,11 +187,11 @@ option(GGML_CPU                             "ggml: enable CPU backend"          
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 
 # 3rd party libs / backends
-option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               ON)
+option(GGML_ACCELERATE                      "ggml: enable Accelerate framework"               OFF)
 option(GGML_BLAS                            "ggml: use BLAS"                                  ${GGML_BLAS_DEFAULT})
 set(GGML_BLAS_VENDOR ${GGML_BLAS_VENDOR_DEFAULT} CACHE STRING
                                             "ggml: BLAS library vendor")
-option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             ${GGML_LLAMAFILE_DEFAULT})
+option(GGML_LLAMAFILE                       "ggml: use LLAMAFILE"                             OFF)
 
 option(GGML_CUDA                            "ggml: use CUDA"                                  OFF)
 option(GGML_MUSA                            "ggml: use MUSA"                                  OFF)
@@ -216,7 +216,7 @@ option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in M
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
 option(GGML_MUSA_MUDNN_COPY                 "ggml: enable muDNN for accelerated copy"         OFF)
-option(GGML_VULKAN                          "ggml: use Vulkan"                                OFF)
+option(GGML_VULKAN                          "ggml: use Vulkan"                                ON)
 option(GGML_VULKAN_CHECK_RESULTS            "ggml: run Vulkan op checks"                      OFF)
 option(GGML_VULKAN_DEBUG                    "ggml: enable Vulkan debug output"                OFF)
 option(GGML_VULKAN_MEMORY_DEBUG             "ggml: enable Vulkan memory debug output"         OFF)
@@ -238,7 +238,7 @@ option(GGML_METAL_EMBED_LIBRARY             "ggml: embed Metal library"         
 set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
                                             "ggml: metal minimum macOS version")
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
-option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
+option(GGML_OPENMP                          "ggml: use OpenMP"                                OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
@@ -318,19 +318,9 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cpu.h
     include/ggml-alloc.h
     include/ggml-backend.h
-    include/ggml-blas.h
-    include/ggml-cann.h
     include/ggml-cpp.h
-    include/ggml-cuda.h
     include/ggml-opt.h
-    include/ggml-metal.h
-    include/ggml-rpc.h
-    include/ggml-virtgpu.h
-    include/ggml-sycl.h
     include/ggml-vulkan.h
-    include/ggml-webgpu.h
-    include/ggml-zendnn.h
-    include/ggml-openvino.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
