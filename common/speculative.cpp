@@ -1263,7 +1263,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     static constexpr float EMA_ALPHA = 0.5f;
     int adaptive_n_max = 0;
     int n_high_streak = 0;
-    static constexpr int HIGH_STREAK_THRESHOLD = 3;
+    static constexpr int HIGH_STREAK_THRESHOLD = 2;
 
     int get_adaptive_n_max(int n_max) {
         if (adaptive_n_max == 0) {
@@ -1276,7 +1276,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (accept_rate_ema > 0.80f) {
             n_high_streak++;
             if (n_high_streak >= HIGH_STREAK_THRESHOLD && adaptive_n_max < 15) {
-                adaptive_n_max++;
+                adaptive_n_max += 2;
                 n_high_streak = 0;
                 LOG_INF("dflash adaptive: increasing n_max to %d (ema=%.1f%%)\n", adaptive_n_max, 100.0f * accept_rate_ema);
             }
